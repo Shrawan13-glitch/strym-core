@@ -1,0 +1,17 @@
+# Build artifacts
+/target/
+/core/target/
+
+# Generated demo output
+/core/assets/*.flv
+
+# Editor/OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Never commit these
+*.pem
+*.key
+.env

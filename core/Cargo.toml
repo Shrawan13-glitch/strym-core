@@ -1,0 +1,34 @@
+[package]
+name = "stream"
+version = "0.1.0"
+edition = "2021"
+description = "Reusable live-streaming core: sync, mux, transport, buffering"
+license = "MIT"
+
+[lib]
+name = "stream"
+
+[[example]]
+name = "flv_demo"
+path = "examples/flv_demo.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Binary-format code packs/ unpacks fixed-width fields constantly; the cast
+# lints fire on every intentional u24/u16 truncation. Values are bounded by
+# protocol limits (tag sizes, chunk sizes) checked at parse time.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+unreadable_literal = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+many_single_char_names = "allow"
