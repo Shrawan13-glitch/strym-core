@@ -8,7 +8,6 @@
 //!
 //! Verify while it runs:  `ffplay rtmp://127.0.0.1:1935/live/mykey`
 
-use std::net::TcpStream;
 use std::process::Command;
 use std::time::Duration;
 
@@ -70,13 +69,8 @@ fn main() {
 
     // Handshake + connect + createStream + publish happen here, before any data.
     println!("[demo] connecting to {url} ...");
-    let sock = TcpStream::connect(host_port).expect("connect to RTMP server");
-    let rtmp_cfg = RtmpConfig {
-        app: "live".into(),
-        key: key.clone(),
-        tc_url: url.clone(),
-    };
-    let transport = RtmpTransport::connect(sock, rtmp_cfg).expect("rtmp publish handshake");
+    let rtmp_cfg = RtmpConfig::new("live", &key, &url);
+    let transport = RtmpTransport::connect_tcp(host_port, rtmp_cfg).expect("rtmp publish handshake");
     println!("[demo] publishing as stream `{key}`");
 
     engine.attach_transport(transport);

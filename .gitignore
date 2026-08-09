@@ -1,6 +1,9 @@
 # Build artifacts
 /target/
 /core/target/
+/core/fuzz/target/
+/core/fuzz/corpus/
+/core/fuzz/artifacts/
 
 # Generated demo output
 /core/assets/*.flv

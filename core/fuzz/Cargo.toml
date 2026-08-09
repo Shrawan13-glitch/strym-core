@@ -1,0 +1,52 @@
+[package]
+name = "stream-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+stream = { path = ".." }
+
+# Prevent this from interfering with the `stream` workspace when the parent
+# manifest changes; the fuzz targets are standalone.
+[workspace]
+
+[[bin]]
+name = "chunk_reassembly"
+path = "fuzz_targets/chunk_reassembly.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "amf0_decode"
+path = "fuzz_targets/amf0_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "flv_tag_parser"
+path = "fuzz_targets/flv_tag_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "h264_headers"
+path = "fuzz_targets/h264_headers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "aac_headers"
+path = "fuzz_targets/aac_headers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rtmp_ingest"
+path = "fuzz_targets/rtmp_ingest.rs"
+test = false
+doc = false

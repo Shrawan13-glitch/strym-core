@@ -61,6 +61,12 @@ struct InitState {
     audio_seq_written: bool,
 }
 
+/// DTS may slip backwards by this many milliseconds (encoder quantization,
+/// capture-thread skew) without us treating it as a genuine ordering violation.
+/// Within this band the DTS is clamped to the previous value so the emitted
+/// stream stays monotonic; anything further back is a real error.
+const REORDER_TOLERANCE_MS: i64 = 100;
+
 /// A writer for FLV tags into a byte sink.
 pub struct FlvMuxer<W: Write> {
     sink: W,
@@ -68,6 +74,16 @@ pub struct FlvMuxer<W: Write> {
     /// clock offset: first timestamp seen becomes 0 so streams don't start at
     /// a huge value after long uptime.
     origin: Option<i64>,
+    /// Most recent normalized DTS written; enforces monotonic output.
+    last_dts: i64,
+    /// H.264 `AVCDecoderConfigurationRecord` last emitted (or sniffed), kept so
+    /// a reconnect can re-send the sequence header — servers forget it.
+    avcc: Option<Vec<u8>>,
+    /// AAC `AudioSpecificConfig` last emitted (or sniffed), same purpose.
+    asc: Option<Vec<u8>>,
+    /// Total bytes written to the sink (FLV header + all tags). The engine uses
+    /// deltas of this to compute the media bitrate for `QoS` telemetry.
+    bytes_written: u64,
 }
 
 impl<W: Write> FlvMuxer<W> {
@@ -77,12 +93,69 @@ impl<W: Write> FlvMuxer<W> {
             sink,
             state: InitState::default(),
             origin: None,
+            last_dts: i64::MIN,
+            avcc: None,
+            asc: None,
+            bytes_written: 0,
         }
     }
 
     /// Returns the inner sink, useful after finishing.
     pub fn into_inner(self) -> W {
         self.sink
+    }
+
+    /// Borrow the sink (the transport) — lets the engine ask it about progress.
+    pub fn sink(&self) -> &W {
+        &self.sink
+    }
+
+    /// Mutably borrow the sink — lets a recorder shut its transport down.
+    pub fn sink_mut(&mut self) -> &mut W {
+        &mut self.sink
+    }
+
+    /// The timestamp origin (first DTS seen), if media has started flowing.
+    pub fn origin(&self) -> Option<i64> {
+        self.origin
+    }
+
+    /// Most recent normalized DTS written (`i64::MIN` before the first packet).
+    pub fn last_dts(&self) -> i64 {
+        self.last_dts
+    }
+
+    /// Carry the timebase over from a previous muxer (reconnect). Keeping the
+    /// same origin and high-water mark means the resumed stream continues the
+    /// timestamp series instead of jumping back to 0 — viewers see one stream,
+    /// not a restart.
+    pub fn restore_timebase(&mut self, origin: Option<i64>, last_dts: i64) {
+        self.origin = origin;
+        self.last_dts = last_dts;
+    }
+
+    /// Re-anchor the origin so `dts` normalizes to exactly the last written
+    /// DTS. This is the clock-drift escape hatch: when the capture clock jumps
+    /// backwards beyond tolerance (platform clock reset, encoder restart),
+    /// output stays monotonic instead of erroring.
+    pub fn rebase(&mut self, dts: i64) {
+        self.origin = Some(dts - self.last_dts.max(0));
+    }
+
+    /// The H.264 decoder configuration in force, if video has been configured.
+    pub fn video_config(&self) -> Option<&[u8]> {
+        self.avcc.as_deref()
+    }
+
+    /// The AAC decoder configuration in force, if audio has been configured.
+    pub fn audio_config(&self) -> Option<&[u8]> {
+        self.asc.as_deref()
+    }
+
+    /// Total bytes written to the sink since creation, FLV header + tags. Used
+    /// by the engine to compute the media bitrate for `QoS` telemetry.
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
     }
 
     /// Flush the underlying sink (used between ticks so bytes leave promptly).
@@ -104,14 +177,24 @@ impl<W: Write> FlvMuxer<W> {
         hdr.extend_from_slice(&[0, 0, 0, 9]); // header size
         hdr.extend_from_slice(&[0, 0, 0, 0]); // first PreviousTagSize0
         self.sink.write_all(&hdr)?;
+        self.bytes_written = self.bytes_written.wrapping_add(hdr.len() as u64);
         self.state.header_written = true;
         Ok(())
     }
 
-    /// Normalize an incoming pts so the stream begins at time 0.
-    fn normalize(&mut self, pts: i64) -> i64 {
-        let o = *self.origin.get_or_insert(pts);
-        pts - o
+    /// Normalize a timestamp against the stream origin (first DTS becomes 0).
+    /// Idempotent after the first call; both DTS and PTS share one origin so
+    /// the composition-time offset (`pts - dts`) survives normalization.
+    fn normalize(&mut self, ts: i64) -> i64 {
+        let o = *self.origin.get_or_insert(ts);
+        ts - o
+    }
+
+    /// Timestamp used for header-style tags (metadata, sequence headers).
+    /// Before media flows that's 0; after a reconnect it's the point the stream
+    /// reached, so re-emitted headers never violate timestamp monotonicity.
+    fn header_ts(&self) -> i64 {
+        self.last_dts.max(0)
     }
 
     /// Emit the script-data tag (`onMetaData`) with stream info. Called once,
@@ -119,7 +202,8 @@ impl<W: Write> FlvMuxer<W> {
     pub fn write_metadata(&mut self, config: &crate::models::StreamConfig) -> Result<(), MuxError> {
         self.ensure_header()?;
         let payload = amf0::on_metadata(config);
-        self.write_tag(TAG_SCRIPT, 0, &payload)
+        let ts = self.header_ts();
+        self.write_tag(TAG_SCRIPT, ts, &payload)
     }
 
     /// Emit the H.264 sequence header (`AVCDecoderConfigurationRecord`). Must
@@ -134,8 +218,10 @@ impl<W: Write> FlvMuxer<W> {
         body.push(0); // AVCPacketType = sequence header
         body.extend_from_slice(&[0, 0, 0]); // composition time = 0
         body.extend_from_slice(avcc);
-        self.write_tag(TAG_VIDEO, 0, &body)?;
+        let ts = self.header_ts();
+        self.write_tag(TAG_VIDEO, ts, &body)?;
         self.state.video_seq_written = true;
+        self.avcc = Some(avcc.to_vec());
         Ok(())
     }
 
@@ -150,8 +236,10 @@ impl<W: Write> FlvMuxer<W> {
         body.push(0xAF); // soundFormat=10 (AAC) | 44.1k | 16-bit | stereo
         body.push(0); // AACPacketType = sequence header
         body.extend_from_slice(asc);
-        self.write_tag(TAG_AUDIO, 0, &body)?;
+        let ts = self.header_ts();
+        self.write_tag(TAG_AUDIO, ts, &body)?;
         self.state.audio_seq_written = true;
+        self.asc = Some(asc.to_vec());
         Ok(())
     }
 
@@ -170,6 +258,7 @@ impl<W: Write> FlvMuxer<W> {
     /// Mux one media packet. Ordering, normalization and sequence-header
     /// emission are handled here so callers stay dumb.
     pub fn write_packet(&mut self, pkt: &MediaPacket) -> Result<(), MuxError> {
+        self.ensure_header()?;
         if !self.state.video_seq_written && pkt.kind == MediaKind::Video && pkt.is_key {
             // best-effort: pull SPS/PPS out of the packet itself
             let avcc = crate::codecs::h264::annexb_to_avcc(&pkt.data)
@@ -183,6 +272,23 @@ impl<W: Write> FlvMuxer<W> {
         }
 
         let ts = self.normalize(pkt.dts);
+        let ts = if ts < self.last_dts {
+            let slip = self.last_dts - ts;
+            if slip > REORDER_TOLERANCE_MS {
+                return Err(MuxError::Ordering(format!(
+                    "DTS went backwards by {slip} ms ({} -> {}); out of tolerance",
+                    self.last_dts, ts
+                )));
+            }
+            // Small backward slip (encoder jitter): clamp to keep the emitted
+            // stream monotonic. FLV players can't decode backward timestamps.
+            self.last_dts
+        } else {
+            ts
+        };
+        self.last_dts = ts;
+        let pts = self.normalize(pkt.pts);
+        let cts = pts.saturating_sub(ts);
 
         match pkt.kind {
             MediaKind::Video => {
@@ -191,7 +297,7 @@ impl<W: Write> FlvMuxer<W> {
                 let frame_type = if pkt.is_key { 1 } else { 2 };
                 body.push((frame_type << 4) | 0x07); // key/inter + AVC
                 body.push(1); // AVCPacketType = NAL unit
-                body.extend_from_slice(&composition_time(pkt.dts, pkt.pts));
+                body.extend_from_slice(&composition_time(cts));
                 body.extend_from_slice(&lp);
                 self.write_tag(TAG_VIDEO, ts, &body)
             }
@@ -219,6 +325,7 @@ impl<W: Write> FlvMuxer<W> {
         // PreviousTagSize = tag header (11) + data
         let prev = 11u32 + data.len() as u32;
         self.sink.write_all(&prev.to_be_bytes())?;
+        self.bytes_written = self.bytes_written.wrapping_add(11 + data.len() as u64 + 4);
         Ok(())
     }
 
@@ -230,21 +337,223 @@ impl<W: Write> FlvMuxer<W> {
     }
 }
 
-/// FLV timestamps are unsigned 24-bit + extended byte (32-bit total). Clamp to
-/// a sane ceiling and never let a negative (out-of-order) time become a huge
-/// unsigned value that puts the frame ~100 days in the future.
+/// FLV timestamps are unsigned 32-bit (24-bit field + extended byte). Clamp to
+/// the full valid range and never let a negative (out-of-order) time become a
+/// huge unsigned value that puts the frame ~100 days in the future.
 fn clamp_ts(ts: i64) -> u32 {
-    ts.clamp(0, 0x0FFF_FFFF) as u32
+    ts.clamp(0, 0xFFFF_FFFF) as u32
 }
 
-/// composition time offset = pts - dts, signed 24-bit per spec.
-fn composition_time(dts: i64, pts: i64) -> [u8; 3] {
-    let v = (pts - dts).clamp(-8_388_608, 8_388_607) as i32;
+/// composition time offset = pts - dts, signed 24-bit per spec. The caller
+/// passes the already-normalized offset; negative (B-frame reorder) is valid.
+fn composition_time(cts: i64) -> [u8; 3] {
+    let v = cts.clamp(-8_388_608, 8_388_607) as i32;
     [((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8]
 }
 
 fn u24(v: u32) -> [u8; 3] {
     [(v >> 16) as u8, (v >> 8) as u8, v as u8]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{MediaPacket, StreamConfig};
+
+    /// A muxer writing into a Vec<u8> with both sequence headers already emitted.
+    fn muxer() -> (FlvMuxer<Vec<u8>>, StreamConfig) {
+        let config = StreamConfig::default();
+        let mut m = FlvMuxer::new(Vec::new());
+        m.write_metadata(&config).unwrap();
+        m.init_codecs(
+            Some(&[
+                0x01, 0x42, 0x00, 0x1F, 0xFF, 0xE1, 0x00, 0x03, 0x67, 0x42, 0x00, 0x0A, 0x01, 0x00, 0x03, 0x68, 0xCE,
+            ]),
+            Some(&[0x0A, 0x10]),
+        )
+        .unwrap();
+        (m, config)
+    }
+
+    fn video(pts: i64, dts: i64, key: bool) -> MediaPacket {
+        MediaPacket {
+            kind: MediaKind::Video,
+            pts,
+            dts,
+            is_key: key,
+            data: vec![0, 0, 0, 1, 0x65, 0x88],
+        }
+    }
+
+    fn audio(pts: i64) -> MediaPacket {
+        MediaPacket {
+            kind: MediaKind::Audio,
+            pts,
+            dts: pts,
+            is_key: false,
+            data: vec![0x21, 0x00, 0x49],
+        }
+    }
+
+    /// Walk tags out of FLV bytes, returning `(kind, ts, data)`.
+    fn parse(bytes: &[u8]) -> Vec<(u8, u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pos = 13;
+        while pos + 11 <= bytes.len() {
+            let kind = bytes[pos];
+            let size = ((bytes[pos + 1] as usize) << 16) | ((bytes[pos + 2] as usize) << 8) | bytes[pos + 3] as usize;
+            let ts24 = ((bytes[pos + 4] as u32) << 16) | ((bytes[pos + 5] as u32) << 8) | bytes[pos + 6] as u32;
+            let ts = (u32::from(bytes[pos + 7]) << 24) | ts24;
+            let start = pos + 11;
+            out.push((kind, ts, bytes[start..start + size].to_vec()));
+            pos = start + size + 4;
+        }
+        out
+    }
+
+    #[test]
+    fn dts_is_monotonic_after_small_backward_slip() {
+        let (mut m, _) = muxer();
+        m.write_packet(&video(0, 0, true)).unwrap();
+        m.write_packet(&video(40, 40, false)).unwrap();
+        // 3 ms backward: clamped, stream stays monotonic.
+        m.write_packet(&video(37, 37, false)).unwrap();
+        let bytes = m.into_inner();
+        let tags = parse(&bytes);
+        let ts: Vec<u32> = tags.iter().map(|t| t.1).collect();
+        assert!(ts.windows(2).all(|w| w[0] <= w[1]), "monotonic: {ts:?}");
+    }
+
+    #[test]
+    fn dts_out_of_tolerance_is_ordering_error() {
+        let (mut m, _) = muxer();
+        m.write_packet(&video(0, 0, true)).unwrap();
+        m.write_packet(&video(40, 40, false)).unwrap();
+        // 1 second backward: a real ordering violation.
+        let err = m.write_packet(&video(0, 40 - 1000, false)).unwrap_err();
+        assert!(matches!(err, MuxError::Ordering(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn negative_cts_is_encoded_within_signed_24bit() {
+        let (mut m, _) = muxer();
+        // B-frame: pts behind dts -> negative composition offset.
+        m.write_packet(&video(10, 20, true)).unwrap();
+        let bytes = m.into_inner();
+        let tags = parse(&bytes);
+        let vtags: Vec<_> = tags.iter().filter(|(k, _, _)| *k == TAG_VIDEO).collect();
+        // sequence header ts 0, frame ts 0 (20-20 origin=20 -> 0)
+        let frame = vtags.last().unwrap();
+        let raw = (i32::from(frame.2[2]) << 16) | (i32::from(frame.2[3]) << 8) | i32::from(frame.2[4]);
+        // sign-extend the 24-bit two's complement field
+        let cts = (raw << 8) >> 8;
+        assert!(cts < 0, "expected negative cts, got {cts}");
+        // FLV spec: signed 24-bit, so 10-20 = -10 encoded as 0xFFFFF6
+        assert_eq!(cts, -10);
+    }
+
+    #[test]
+    fn ts_beyond_24bit_uses_extended_byte() {
+        let (mut m, _) = muxer();
+        // First frame anchors the origin; a later frame at 0x0100_0000 ms
+        // (16,777,216 ms after it) needs the 8-bit extended timestamp.
+        m.write_packet(&video(0, 0, true)).unwrap();
+        m.write_packet(&video(0x0100_0000, 0x0100_0000, false)).unwrap();
+        let bytes = m.into_inner();
+        let tags = parse(&bytes);
+        let vtags: Vec<_> = tags.iter().filter(|(k, _, _)| *k == TAG_VIDEO).collect();
+        let frame = vtags.last().unwrap();
+        assert_eq!(frame.1, 0x0100_0000, "24-bit + extended byte must round-trip");
+    }
+
+    #[test]
+    fn negative_origin_ts_clamped_to_zero() {
+        let (mut m, _) = muxer();
+        // First frame at 10s, a reordered frame arriving at 9.999s relative to
+        // the true origin would have gone negative before normalization; the
+        // muxer must never emit a huge unsigned ts.
+        m.write_packet(&video(10_000, 10_000, true)).unwrap();
+        let bytes = m.into_inner();
+        let tags = parse(&bytes);
+        let vtags: Vec<_> = tags.iter().filter(|(k, _, _)| *k == TAG_VIDEO).collect();
+        assert_eq!(vtags.last().unwrap().1, 0);
+    }
+
+    #[test]
+    fn audio_negative_cts_not_applied() {
+        let (mut m, _) = muxer();
+        m.write_packet(&audio(0)).unwrap();
+        let bytes = m.into_inner();
+        let tags = parse(&bytes);
+        let atags: Vec<_> = tags.iter().filter(|(k, _, _)| *k == TAG_AUDIO).collect();
+        assert_eq!(atags.last().unwrap().1, 0);
+    }
+
+    #[test]
+    fn restored_timebase_continues_timestamp_series() {
+        // First muxer reaches ts 5000; a replacement (reconnect) carrying the
+        // timebase over must continue from there, not restart at 0.
+        let (mut m, _) = muxer();
+        m.write_packet(&video(0, 0, true)).unwrap();
+        m.write_packet(&video(5000, 5000, false)).unwrap();
+        let (origin, last) = (m.origin(), m.last_dts());
+
+        let mut resumed = FlvMuxer::new(Vec::new());
+        resumed.restore_timebase(origin, last);
+        resumed.write_packet(&video(5040, 5040, false)).unwrap();
+        let bytes = resumed.into_inner();
+        let tags = parse(&bytes);
+        let vtags: Vec<_> = tags.iter().filter(|(k, _, _)| *k == TAG_VIDEO).collect();
+        assert_eq!(vtags.last().unwrap().1, 5040);
+    }
+
+    #[test]
+    fn rebase_keeps_output_monotonic_after_clock_reset() {
+        let (mut m, _) = muxer();
+        m.write_packet(&video(0, 0, true)).unwrap();
+        m.write_packet(&video(10_000, 10_000, false)).unwrap();
+        // Capture clock resets far backwards: rebasing continues from the
+        // high-water mark instead of an ordering error.
+        m.rebase(40);
+        m.write_packet(&video(40, 40, true)).unwrap();
+        m.write_packet(&video(80, 80, false)).unwrap();
+        let bytes = m.into_inner();
+        let tags = parse(&bytes);
+        let ts: Vec<u32> = tags.iter().map(|t| t.1).collect();
+        assert!(ts.windows(2).all(|w| w[0] <= w[1]), "monotonic: {ts:?}");
+        assert_eq!(*ts.last().unwrap(), 10_040);
+    }
+
+    #[test]
+    fn sequence_headers_are_cached_and_remembered() {
+        let (mut m, _) = muxer();
+        m.write_packet(&video(0, 0, true)).unwrap();
+        assert!(m.video_config().is_some());
+        assert!(m.audio_config().is_some());
+    }
+
+    #[test]
+    fn reemitted_headers_after_resume_are_monotonic() {
+        // After a reconnect the fresh muxer re-emits metadata + sequence
+        // headers at the resumed time, never below it.
+        let (mut m, cfg) = muxer();
+        m.write_packet(&video(0, 0, true)).unwrap();
+        m.write_packet(&video(3000, 3000, false)).unwrap();
+        let (origin, last) = (m.origin(), m.last_dts());
+        let (avcc, asc) = (m.video_config().unwrap().to_vec(), m.audio_config().unwrap().to_vec());
+
+        let mut resumed = FlvMuxer::new(Vec::new());
+        resumed.restore_timebase(origin, last);
+        resumed.write_metadata(&cfg).unwrap();
+        resumed.write_video_sequence(&avcc).unwrap();
+        resumed.write_audio_sequence(&asc).unwrap();
+        resumed.write_packet(&video(3040, 3040, true)).unwrap();
+        let bytes = resumed.into_inner();
+        let tags = parse(&bytes);
+        let ts: Vec<u32> = tags.iter().map(|t| t.1).collect();
+        assert!(ts.windows(2).all(|w| w[0] <= w[1]), "monotonic: {ts:?}");
+        assert_eq!(ts[0], 3000, "re-emitted headers sit at the resumed time");
+    }
 }
 
 /// Minimal AMF0 encoder — just enough for `onMetaData`.

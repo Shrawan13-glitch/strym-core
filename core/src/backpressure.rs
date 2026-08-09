@@ -53,6 +53,17 @@ impl<T> BoundedBuffer<T> {
         self.queue.pop_front()
     }
 
+    /// Return items to the **front** of the buffer, preserving their order.
+    /// Used when a send fails partway through a batch: the unsent packets go
+    /// back to the head of the line instead of being lost. Not counted as
+    /// pushes; the caller only restores what it previously drained.
+    pub fn restore_front(&mut self, items: impl IntoIterator<Item = T>) {
+        let items: Vec<T> = items.into_iter().collect();
+        for item in items.into_iter().rev() {
+            self.queue.push_front(item);
+        }
+    }
+
     /// When behind, discard everything up to (but not including) the newest
     /// keyframe. The keyframe and all newer packets stay in the buffer, so a
     /// normal drain resumes from a clean decode point. Returns how many
@@ -66,6 +77,18 @@ impl<T> BoundedBuffer<T> {
             }
             None => 0,
         }
+    }
+
+    /// Peek at the oldest buffered packet, if any.
+    pub fn front(&self) -> Option<&T> {
+        self.queue.front()
+    }
+
+    /// Count one packet as dropped without touching the queue — for packets the
+    /// engine discards during a drain (e.g. an inter-frame orphaned by a
+    /// reconnect, when the buffer held no keyframe to resume from).
+    pub fn record_drop(&mut self) {
+        self.dropped += 1;
     }
 
     /// Number of packets currently held.
@@ -139,5 +162,46 @@ mod tests {
         assert_eq!(b.len(), 1); // only the keyframe 8 remains
         assert_eq!(b.pop_oldest(), Some(8));
         assert_eq!(b.pop_oldest(), None);
+    }
+
+    #[test]
+    fn front_peeks_oldest_without_removing() {
+        let mut b = BoundedBuffer::new(4);
+        assert_eq!(b.front(), None);
+        b.push(1);
+        b.push(2);
+        assert_eq!(b.front(), Some(&1));
+        assert_eq!(b.len(), 2, "peek must not drain");
+    }
+
+    #[test]
+    fn record_drop_counts_without_touching_queue() {
+        let mut b = BoundedBuffer::new(4);
+        b.push(1);
+        b.push(2);
+        b.record_drop();
+        b.record_drop();
+        assert_eq!(b.dropped(), 2);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b.pop_oldest(), Some(1));
+    }
+
+    #[test]
+    fn restore_front_returns_items_in_order() {
+        let mut b = BoundedBuffer::new(8);
+        for i in 0..4 {
+            b.push(i);
+        }
+        // Drain, then hand back the unsent tail as a failed send would.
+        let drained: Vec<u32> = std::iter::from_fn(|| b.pop_oldest()).collect();
+        assert_eq!(drained, vec![0, 1, 2, 3]);
+        b.restore_front(vec![1, 2, 3]);
+        assert_eq!(b.len(), 3);
+        assert_eq!(b.pop_oldest(), Some(1));
+        assert_eq!(b.pop_oldest(), Some(2));
+        assert_eq!(b.pop_oldest(), Some(3));
+        // Restore is not a push: counters stay honest.
+        assert_eq!(b.pushed(), 4);
+        assert_eq!(b.dropped(), 0);
     }
 }

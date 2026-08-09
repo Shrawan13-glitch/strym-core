@@ -20,7 +20,7 @@ pub enum MediaKind {
 /// Timestamps are in **milliseconds**, relative to a single shared clock
 /// source (`clock::Clock`). Both `pts` and `dts` are kept so the muxer can
 /// pack the composition-time offset used by players.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaPacket {
     /// Whether this packet carries video or audio.
     pub kind: MediaKind,
@@ -93,8 +93,9 @@ impl Default for StreamConfig {
     }
 }
 
-/// Summary of how the buffer behaved, surfaced to the platform so it can react
-/// to a weak network (e.g., lower bitrate).
+/// Summary of how the stream is behaving, surfaced to the platform so it can
+/// react to a weak network (e.g., lower bitrate). A cheaper, counter-level view
+/// than the full [`crate::telemetry::QosSample`]s retained by the collector.
 #[derive(Debug, Clone, Default)]
 pub struct PacketStats {
     /// Packets accepted from the platform.
@@ -107,6 +108,18 @@ pub struct PacketStats {
     pub in_buffered_count: usize,
     /// current buffer lag in ms (largest pts not yet muxed minus exposure)
     pub buffer_ms: i64,
+    /// Bytes written into the container (FLV), header + tags included.
+    pub media_bytes: u64,
+    /// Bytes the transport accepted for the wire, framing included.
+    pub wire_bytes: u64,
+    /// Latest measured round-trip time to the peer, when the transport reports it.
+    pub rtt_ms: Option<f64>,
+    /// Successful reconnects since the engine was created.
+    pub reconnects: u64,
+    /// Failed reconnect attempts since the engine was created.
+    pub reconnect_attempts: u64,
+    /// Milliseconds since the engine (and its clock) was created.
+    pub uptime_ms: u64,
 }
 
 impl PacketStats {

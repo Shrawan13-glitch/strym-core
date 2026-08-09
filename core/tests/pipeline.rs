@@ -3,8 +3,11 @@
 //! the resulting bytes form a well-formed, playable FLV stream: header, script
 //! metadata, codec sequence headers, and correctly timestamped media tags.
 
+use std::time::Duration;
+
 use stream::engine::{Engine, EngineConfig};
 use stream::models::{MediaPacket, StreamConfig};
+use stream::telemetry::QosConfig;
 use stream::transport::FileTransport;
 
 const START_CODE: &[u8] = &[0x00, 0x00, 0x00, 0x01];
@@ -269,4 +272,93 @@ fn engine_writes_provided_codec_configs() {
         .find(|t| t.kind == TAG_AUDIO && t.data.get(1) == Some(&0))
         .expect("audio sequence header written");
     assert_eq!(&aseq.data[2..4], &ASC_AAC_LC_44K_STEREO);
+}
+
+/// The engine must actually emit `QoS` samples through the real path — not
+/// just the collector computing summaries on injected samples. With a
+/// zero-interval config every `tick` produces a sample, so a quick loop can
+/// fill a full hour-equivalent window (3600 samples, 1/s for 1h) into the ring
+/// and verify it is retained in order and folded into a complete, queryable
+/// summary.
+#[test]
+fn engine_emits_qos_samples_into_queryable_summary() {
+    let config = EngineConfig {
+        qos: QosConfig {
+            interval: Duration::ZERO,
+            capacity: 4096,
+        },
+        ..Default::default()
+    };
+    let engine: Engine<FileTransport<Vec<u8>>> = Engine::new(config);
+    engine.attach_transport(FileTransport::new(Vec::new()));
+
+    // A couple of seconds of 30fps video + audio: enough media that the rate
+    // samples carry non-zero byte counts.
+    let key = annex_b(&[&sps(), &pps(), &idr(&[0x21, 0x88, 0x84])]);
+    let audio = adts(&[0x21, 0x00, 0x49, 0x90, 0x01, 0x02]);
+    let mut packets = Vec::new();
+    let mut pts = 0;
+    for _ in 0..30 {
+        packets.push(MediaPacket::video(pts, pts == 0, key.clone()));
+        packets.push(MediaPacket::audio(pts, audio.clone()));
+        pts += 33;
+    }
+    engine.push_all(packets).unwrap();
+
+    // First tick drains and muxes the media; the rest just fill the ring.
+    for _ in 0..3600 {
+        engine.tick().unwrap();
+    }
+
+    let qos = engine.qos();
+    assert_eq!(qos.sample_count(), 3600, "ring must retain the full window");
+    let samples = qos.samples();
+    assert_eq!(samples.len(), 3600);
+    for pair in samples.windows(2) {
+        assert!(pair[0].wall_ms <= pair[1].wall_ms, "samples not chronological");
+        assert!(pair[0].uptime_ms <= pair[1].uptime_ms, "uptime went backwards");
+    }
+
+    let s = qos.summary();
+    assert_eq!(s.samples, 3600);
+    assert!(s.avg_bitrate_out_bps > 0.0, "media bitrate missing from summary");
+    assert!(s.avg_throughput_bps > 0.0, "wire throughput missing from summary");
+    assert!(s.peak_bitrate_out_bps >= s.avg_bitrate_out_bps);
+    assert_eq!(s.reconnects, 0);
+    assert_eq!(s.reconnect_attempts, 0);
+    assert!(s.muxed <= s.pushed && s.dropped <= s.pushed);
+
+    // Engine stats and the collector must agree on the same counters.
+    let stats = engine.stats();
+    assert_eq!(stats.pushed, s.pushed);
+    assert_eq!(stats.muxed, s.muxed);
+    assert_eq!(stats.dropped, s.dropped);
+}
+
+/// The ring only reflects elapsed stream time via the spacing between samples;
+/// with a non-zero interval the summary must span the real time that passed
+/// between the first and last sample.
+#[test]
+fn qos_summary_spans_real_elapsed_time() {
+    let config = EngineConfig {
+        qos: QosConfig {
+            interval: Duration::from_millis(1),
+            capacity: 16,
+        },
+        ..Default::default()
+    };
+    let engine: Engine<FileTransport<Vec<u8>>> = Engine::new(config);
+    engine.attach_transport(FileTransport::new(Vec::new()));
+
+    for _ in 0..6 {
+        std::thread::sleep(Duration::from_millis(2));
+        engine.tick().unwrap();
+    }
+    let s = engine.qos().summary();
+    assert!(
+        s.samples >= 3,
+        "expected most ticks to emit a sample, got {}",
+        s.samples
+    );
+    assert!(s.span_secs > 0.0, "summary must span the real time between samples");
 }

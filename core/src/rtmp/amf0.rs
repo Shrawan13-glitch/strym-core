@@ -189,6 +189,7 @@ impl<'a> Reader<'a> {
     /// Skip a length-prefixed UTF-8 string (e.g. a command name).
     pub fn skip_utf8(&mut self) -> Option<()> {
         let len = self.read_u16()? as usize;
+        self.data.get(self.pos..self.pos + len)?;
         self.pos += len;
         Some(())
     }
@@ -218,7 +219,8 @@ impl<'a> Reader<'a> {
                 out.push((String::new(), self.read_value()?));
             } else {
                 let keylen = keylen as usize;
-                let key = String::from_utf8_lossy(&self.data[self.pos..self.pos + keylen]).into_owned();
+                let raw = self.data.get(self.pos..self.pos + keylen)?;
+                let key = String::from_utf8_lossy(raw).into_owned();
                 self.pos += keylen;
                 out.push((key, self.read_value()?));
             }
@@ -227,7 +229,8 @@ impl<'a> Reader<'a> {
         Some(())
     }
 
-    /// Read one complete AMF0 value, or `None` if the input is truncated.
+    /// Read one complete AMF0 value, or `None` if the input is truncated or
+    /// carries a type marker this minimal codec doesn't understand.
     pub fn read_value(&mut self) -> Option<Val> {
         match self.read_u8()? {
             TYPE_NUMBER => self.read_f64().map(Val::Number),
@@ -247,12 +250,18 @@ impl<'a> Reader<'a> {
             }
             TYPE_NULL => Some(Val::Null),
             TYPE_UNDEFINED => Some(Val::Undefined),
-            _ => {
-                // Unknown type: skip 8 bytes as a best-effort (numbers), else bail.
-                self.pos += 8;
-                Some(Val::Undefined)
-            }
+            _ => None,
         }
+    }
+
+    /// Read every remaining value until the input is exhausted or an invalid
+    /// marker appears. Never panics, regardless of input.
+    pub fn read_all(&mut self) -> Vec<Val> {
+        let mut out = Vec::new();
+        while let Some(v) = self.read_value() {
+            out.push(v);
+        }
+        out
     }
 }
 
@@ -280,5 +289,38 @@ mod tests {
                 ("b".into(), Val::Number(2.0))
             ]))
         );
+    }
+
+    #[test]
+    fn truncated_object_is_none_not_panic() {
+        let mut w = Writer::new();
+        w.object(&[("key", amf0_str("value"))]);
+        let bytes = w.into_bytes();
+        // Chop the encoding at every length: none may panic.
+        for cut in 0..=bytes.len() {
+            let mut r = Reader::new(&bytes[..cut]);
+            let _ = r.read_value();
+        }
+    }
+
+    #[test]
+    fn truncated_string_is_none() {
+        assert_eq!(Reader::new(&[TYPE_STRING, 0x00, 0x10, b'a']).read_value(), None);
+        assert_eq!(Reader::new(&[TYPE_STRING, 0xFF]).read_value(), None);
+    }
+
+    #[test]
+    fn unknown_marker_is_none() {
+        assert_eq!(Reader::new(&[0x0C, 0, 0, 0, 0, 0, 0, 0, 0]).read_value(), None);
+    }
+
+    #[test]
+    fn skip_utf8_respects_bounds() {
+        let mut r = Reader::new(&[0x00, 0x05, b'a']);
+        assert_eq!(r.skip_utf8(), None);
+    }
+
+    fn amf0_str(s: &str) -> ObjVal<'_> {
+        ObjVal::Str(s)
     }
 }

@@ -39,3 +39,30 @@ jobs:
 
       - name: Tests (release)
         run: cargo test --release
+
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal --component llvm-tools-preview
+          cargo +nightly install cargo-fuzz --locked
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core/fuzz
+
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+        working-directory: core
+
+      - name: Smoke fuzz each target (5s)
+        run: |
+          for target in chunk_reassembly amf0_decode flv_tag_parser h264_headers aac_headers rtmp_ingest; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=5 -runs=1000
+          done
+        working-directory: core

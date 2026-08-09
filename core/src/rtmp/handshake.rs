@@ -25,7 +25,11 @@ fn slot_digest(block: &[u8], offset: usize, key: &[u8]) -> [u8; DIGEST_LEN] {
 }
 
 /// True if the block already carries a valid digest at `offset` under `key`.
+/// Blocks too short to hold the slot never validate (instead of panicking).
 fn slot_is_valid(block: &[u8], offset: usize, key: &[u8]) -> bool {
+    if block.len() < offset + DIGEST_LEN {
+        return false;
+    }
     block[offset..offset + DIGEST_LEN] == slot_digest(block, offset, key)
 }
 
@@ -47,37 +51,87 @@ pub fn build_c1(time: u32) -> (u8, [u8; BLOCK_LEN]) {
 /// and is accepted by nginx-rtmp, SRS (fallback) and node-media-server.
 pub fn build_c1_simple(time: u32) -> (u8, [u8; BLOCK_LEN]) {
     let mut block = [0u8; BLOCK_LEN];
-    block[..4].copy_from_slice(&time.to_be_bytes());
-    let mut x = time as u64 ^ 0x2545_F491_4F6C_DD1D;
+    fill_random(&mut block, u64::from(time));
+    (3, block)
+}
+
+/// Fill the random section (`[8..]`) of a handshake block from a seed, leaving
+/// the timestamp in `[..4]` and version bytes at `[4..8]`.
+fn fill_random(block: &mut [u8; BLOCK_LEN], seed: u64) {
+    block[..4].copy_from_slice(&(seed as u32).to_be_bytes());
+    let mut x = seed;
     for b in &mut block[8..] {
         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         *b = (x >> 33) as u8;
     }
-    (3, block)
 }
 
 /// Build a block with a valid digest under an arbitrary key and schema offset.
 /// The server side uses `FMS_KEY2` (schema 0) for its S1; clients use `FMS_KEY1`.
 pub fn build_block(time: u32, key: &[u8], offset: usize) -> (u8, [u8; BLOCK_LEN]) {
+    build_block_seeded(time, u64::from(time) ^ 0x2545_F491_4F6C_DD1D, key, offset)
+}
+
+/// Like [`build_block`] but with an explicit filler seed, so the server can
+/// mint a fresh S1 per connection (two sessions in the same wall-clock second
+/// otherwise get identical S1s).
+fn build_block_seeded(time: u32, seed: u64, key: &[u8], offset: usize) -> (u8, [u8; BLOCK_LEN]) {
     let mut block = [0u8; BLOCK_LEN];
-    block[..4].copy_from_slice(&time.to_be_bytes());
-    // Deterministic pseudo-random filler.
-    let mut x = time as u64 ^ 0x2545_F491_4F6C_DD1D;
-    for b in &mut block[8..] {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        *b = (x >> 33) as u8;
-    }
+    fill_random(&mut block, u64::from(time) ^ seed ^ 0x2545_F491_4F6C_DD1D);
     let digest = slot_digest(&block, offset, key);
     block[offset..offset + DIGEST_LEN].copy_from_slice(&digest);
     (3, block)
+}
+
+/// Build a server S1 in the plain "simple" handshake form (`time + zeros +
+/// random`, no embedded digest). Every RTMP client can consume this — ffmpeg
+/// and our own transport in simple mode, and digest-capable clients simply fall
+/// back to the simple path. Combined with [`build_s2`] echoing C1, this is the
+/// maximal-compatibility server handshake (the one nginx-rtmp serves simple
+/// clients).
+pub fn build_s1_simple(time: u32, seed: u64) -> [u8; BLOCK_LEN] {
+    let mut block = [0u8; BLOCK_LEN];
+    fill_random(&mut block, seed ^ 0x2545_F491_4F6C_DD1D);
+    block[..4].copy_from_slice(&time.to_be_bytes());
+    block
+}
+
+/// Build a well-formed server S1 (complex form, `FMS_KEY2` digest at offset 8)
+/// with a caller-chosen filler seed — per-connection freshness on the ingest
+/// server.
+pub fn build_s1(time: u32, seed: u64) -> [u8; BLOCK_LEN] {
+    build_block_seeded(time, seed, FMS_KEY2, DIGEST_OFFSETS[0]).1
+}
+
+/// Build a well-formed server S2 echoing the client's C1. Mirrors the client's
+/// [`build_c2`]: if C1 carries a valid client digest (complex handshake) that
+/// digest is echoed at its offset, otherwise C1's random bytes are echoed
+/// (simple handshake, what ffmpeg sends).
+pub fn build_s2(c1: &[u8]) -> [u8; BLOCK_LEN] {
+    let mut s2 = [0u8; BLOCK_LEN];
+    if c1.len() < BLOCK_LEN {
+        return s2;
+    }
+    s2[..8].copy_from_slice(&c1[..8]);
+    if let Some(off) = find_digest_offset(c1, FMS_KEY1) {
+        s2[off..off + DIGEST_LEN].copy_from_slice(&c1[off..off + DIGEST_LEN]);
+    } else {
+        s2[8..].copy_from_slice(&c1[8..]);
+    }
+    s2
 }
 
 /// Build C2 from the peer's S1 block. This adapts to either handshake style:
 /// if S1 carries a valid server digest (complex handshake) we echo that digest
 /// at its offset; otherwise (simple handshake) we echo S1's random bytes.
 /// In both cases the peer's time/version are copied into the first 8 bytes.
+/// A block shorter than the 1536-byte protocol block yields an all-zero C2
+/// (the handshake will fail at the peer — never a panic here).
 pub fn build_c2(s1: &[u8]) -> [u8; BLOCK_LEN] {
     let mut c2 = [0u8; BLOCK_LEN];
+    if s1.len() < BLOCK_LEN {
+        return c2;
+    }
     c2[..8].copy_from_slice(&s1[..8]);
     if let Some(off) = find_digest_offset(s1, FMS_KEY2) {
         c2[off..off + DIGEST_LEN].copy_from_slice(&s1[off..off + DIGEST_LEN]);
@@ -91,7 +145,7 @@ pub fn build_c2(s1: &[u8]) -> [u8; BLOCK_LEN] {
 /// Build a well-formed server S1 (complex form, `FMS_KEY2` digest at offset 8)
 /// for tests / diagnostics.
 pub fn build_s1_complex(time: u32) -> [u8; BLOCK_LEN] {
-    build_block(time, FMS_KEY2, DIGEST_OFFSETS[0]).1
+    build_s1(time, u64::from(time) ^ 0x2545_F491_4F6C_DD1D)
 }
 
 /// Does the peer's block carry a verifiable server digest? (Diagnostics/tests.)
@@ -124,6 +178,16 @@ mod tests {
     }
 
     #[test]
+    fn short_blocks_never_panic() {
+        for len in [0usize, 1, 8, 40, 804, BLOCK_LEN - 1] {
+            let block = vec![0xABu8; len];
+            assert!(!validate_s1(&block));
+            let c2 = build_c2(&block);
+            assert_eq!(c2, [0u8; BLOCK_LEN]);
+        }
+    }
+
+    #[test]
     fn simple_c1_has_no_digest() {
         let (_c0, c1) = build_c1_simple(7);
         assert_eq!(find_digest_offset(&c1, FMS_KEY1), None);
@@ -146,5 +210,18 @@ mod tests {
         let c2 = build_c2(&s1);
         let off = find_digest_offset(&s1, FMS_KEY2).expect("server digest offset");
         assert_eq!(&c2[off..off + DIGEST_LEN], &s1[off..off + DIGEST_LEN]);
+    }
+
+    #[test]
+    fn simple_s1_carries_no_digest_and_c2_echoes_it() {
+        let s1 = build_s1_simple(100, 0x1234_5678);
+        assert_eq!(find_digest_offset(&s1, FMS_KEY2), None);
+        assert_eq!(u32::from_be_bytes([s1[0], s1[1], s1[2], s1[3]]), 100);
+        // Two seeds mint different blocks (per-connection freshness).
+        let other = build_s1_simple(100, 0x9ABC_DEF0);
+        assert_ne!(&s1[8..], &other[8..]);
+        // A client's C2 echoes the simple S1's random bytes.
+        let c2 = build_c2(&s1);
+        assert_eq!(&c2[8..], &s1[8..]);
     }
 }

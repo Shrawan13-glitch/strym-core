@@ -8,6 +8,10 @@ license = "MIT"
 [lib]
 name = "stream"
 
+[dev-dependencies]
+# Property tests for codec round-trips (Phase 2). Dev-only; never shipped.
+proptest = "1"
+
 [[example]]
 name = "flv_demo"
 path = "examples/flv_demo.rs"
