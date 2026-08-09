@@ -1,10 +1,13 @@
 //! Publish a live stream to a real RTMP server using the core's `RtmpTransport`.
 //!
-//! Uses the same ffmpeg-generated H.264/AAC test media as `flv_demo`, but sends
-//! it over RTMP instead of writing a file.
+//! Uses ffmpeg-generated H.264/AAC test media (a timestamped test pattern plus a
+//! audio tone), sends it over RTMP, paced in real time. The video source is
+//! `testsrc`, which draws a moving frame counter + seconds clock, so a live
+//! viewer can tell at a glance the stream is actually advancing.
 //!
-//! Run:  `cargo run --example rtmp_demo -- <rtmp-url> [stream-key]`
-//! e.g.  `cargo run --example rtmp_demo -- rtmp://127.0.0.1:1935/live mykey`
+//! Run:  `cargo run --example rtmp_demo -- <url> [stream-key] [seconds] [WxH]`
+//! e.g.  `cargo run --example rtmp_demo -- rtmp://127.0.0.1:1935/live mykey 600 640x360`
+//!       `cargo run --example rtmp_demo -- rtmp://a.rtmp.youtube.com/live2 <your-key> 900 1280x720`
 //!
 //! Verify while it runs:  `ffplay rtmp://127.0.0.1:1935/live/mykey`
 
@@ -16,28 +19,48 @@ use stream::engine::{Engine, EngineConfig};
 use stream::models::{MediaPacket, StreamConfig};
 use stream::rtmp::{RtmpConfig, RtmpTransport};
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let url = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "rtmp://127.0.0.1:1935/live".into());
     let key = std::env::args().nth(2).unwrap_or_else(|| "demo".into());
-    let host_port = url
-        .strip_prefix("rtmp://")
-        .unwrap_or(&url)
-        .split('/')
-        .next()
-        .unwrap_or(&url);
+    // [duration] defaults to 10 minutes; [WxH] defaults to 640x360.
+    let duration_s = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(600u64);
+    let (width, height) = std::env::args().nth(4).map_or((640, 360), |s| {
+        let mut it = s.split('x');
+        let w = it.next().and_then(|p| p.parse().ok()).unwrap_or(640);
+        let h = it.next().and_then(|p| p.parse().ok()).unwrap_or(360);
+        (w, h)
+    });
+    let fps = 30.0;
+    // Parse `rtmp://host[:port]/app` (port optional, defaults to 1935). The app
+    // name comes from the URL path (e.g. YouTube's `live2`); tcUrl is rebuilt
+    // without a trailing slash so servers don't reject the connect.
+    let rest = url.strip_prefix("rtmp://").unwrap_or(&url);
+    let (host_port, app) = match rest.split_once('/') {
+        Some((host_part, path)) => {
+            let (host, port) = match host_part.rsplit_once(':') {
+                Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_owned(), p.to_owned()),
+                _ => (host_part.to_owned(), "1935".to_owned()),
+            };
+            let app = path.split('/').next().unwrap_or("live");
+            (format!("{host}:{port}"), app.to_owned())
+        }
+        None => (format!("{rest}:1935"), "live".to_owned()),
+    };
+    let tc_url = format!("rtmp://{host_port}/{app}");
 
     let work = std::env::temp_dir().join("stream_core_demo");
     std::fs::create_dir_all(&work).ok();
     let video = work.join("video.h264");
     let audio = work.join("audio.aac");
 
-    println!("[demo] generating test media with ffmpeg...");
-    gen_media(&video, &audio);
+    println!("[demo] generating {duration_s}s of test media at {width}x{height} with ffmpeg...");
+    gen_media(&video, &audio, duration_s, width, height, fps);
 
     println!("[demo] parsing into media packets...");
-    let video_packets = parse_video(&video);
+    let video_packets = parse_video(&video, fps);
     let audio_packets = parse_audio(&audio);
     println!(
         "[demo]   {} video packets, {} audio packets",
@@ -58,9 +81,9 @@ fn main() {
 
     let config = EngineConfig {
         stream: StreamConfig {
-            width: 128,
-            height: 96,
-            framerate: 15.0,
+            width,
+            height,
+            framerate: fps,
             ..Default::default()
         },
         ..Default::default()
@@ -69,9 +92,9 @@ fn main() {
 
     // Handshake + connect + createStream + publish happen here, before any data.
     println!("[demo] connecting to {url} ...");
-    let rtmp_cfg = RtmpConfig::new("live", &key, &url);
-    let transport = RtmpTransport::connect_tcp(host_port, rtmp_cfg).expect("rtmp publish handshake");
-    println!("[demo] publishing as stream `{key}`");
+    let rtmp_cfg = RtmpConfig::new(&app, &key, &tc_url);
+    let transport = RtmpTransport::connect_tcp(&host_port, rtmp_cfg).expect("rtmp publish handshake");
+    println!("[demo] publishing (stream key set, not shown)");
 
     engine.attach_transport(transport);
     engine
@@ -122,24 +145,27 @@ fn main() {
     );
 }
 
-fn gen_media(video: &std::path::Path, audio: &std::path::Path) {
+fn gen_media(video: &std::path::Path, audio: &std::path::Path, seconds: u64, w: u32, h: u32, fps: f64) {
+    // `testsrc` carries a moving frame counter + running seconds clock, so a
+    // viewer can immediately tell the stream is advancing (live), not a slab.
+    let gop = (fps * 2.0).round() as u32; // full keyframe every 2s
     let v = Command::new("ffmpeg")
         .args([
             "-y",
             "-f",
             "lavfi",
             "-i",
-            "testsrc2=size=128x96:rate=15:duration=3",
+            &format!("testsrc=size={w}x{h}:rate={fps}:duration={seconds}"),
             "-c:v",
             "libopenh264",
             "-b:v",
-            "400k",
+            if w * h > 640 * 360 { "1800k" } else { "800k" },
             "-profile:v",
             "66",
             "-pix_fmt",
             "yuv420p",
             "-g",
-            "15",
+            &gop.to_string(),
         ])
         .arg(video)
         .output();
@@ -150,7 +176,7 @@ fn gen_media(video: &std::path::Path, audio: &std::path::Path) {
             "-f",
             "lavfi",
             "-i",
-            "sine=frequency=440:duration=3",
+            &format!("sine=frequency=440:duration={seconds}"),
             "-c:a",
             "aac",
             "-b:a",
@@ -176,11 +202,11 @@ fn check_ffmpeg(out: &Result<std::process::Output, std::io::Error>, what: &str) 
 /// NAL unit types that carry picture slices (VCL units).
 const VCL: [u8; 5] = [1, 2, 3, 4, 5];
 
-fn parse_video(path: &std::path::Path) -> Vec<MediaPacket> {
+fn parse_video(path: &std::path::Path, fps: f64) -> Vec<MediaPacket> {
     let data = std::fs::read(path).expect("read video.h264");
     let nals = h264::split_annex_b(&data);
     let mut out = Vec::new();
-    let frame_ms = 1000.0 / 15.0;
+    let frame_ms = 1000.0 / fps;
     let mut i = 0usize;
     for nal in nals {
         let t = nal[0] & 0x1F;

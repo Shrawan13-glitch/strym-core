@@ -527,10 +527,14 @@ impl<S: Read + Write> RtmpTransport<S> {
             rtt: None,
         };
         // Tell the server to expect our larger chunks (and match its own). Sent
-        // right after the handshake, before the first command.
+        // right after the handshake, before the first command. The *inbound*
+        // reader stays at the 128-byte protocol default: the peer decides when
+        // to switch its own chunking and says so via an inbound Set Chunk Size
+        // control message (handled in `read_message`). Assuming the peer has
+        // already switched is what breaks against real servers (e.g. YouTube)
+        // that keep 128-byte chunks for the early control plane.
         t.send_set_chunk_size(NEGOTIATED_CHUNK_SIZE)?;
         t.chunk = NEGOTIATED_CHUNK_SIZE;
-        t.reader.set_chunk_size(NEGOTIATED_CHUNK_SIZE)?;
         t.connect_app()?;
         let sid = t.create_stream()?;
         t.do_publish(sid)?;
@@ -968,11 +972,15 @@ mod tests {
 
     /// Misbehaviors the fake server can exhibit, one per error-path test.
     #[derive(Default)]
+    #[allow(clippy::struct_excessive_bools)]
     struct Behavior {
         connect_error: bool,
         refuse_publish: bool,
         ping_before_create_stream: bool,
         window_ack: Option<u32>,
+        /// Reply framed in default 128-byte chunks, ignoring the client's
+        /// negotiated size — what some real ingest servers (e.g. `YouTube`) do.
+        keep_128_chunks: bool,
     }
 
     /// A minimal RTMP server exercised against our client: performs the handshake,
@@ -992,7 +1000,9 @@ mod tests {
         let mut c2 = [0u8; 1536];
         h.read_exact(&mut c2)?;
 
-        // Control plane.
+        // Control plane. Some real servers keep replying in 128-byte chunks
+        // even after the client's own Set Chunk Size (`keep_128_chunks`).
+        let reply_chunk = if behavior.keep_128_chunks { 128 } else { 4096 };
         let mut reader = ChunkReader::new();
         loop {
             let msg = reader.read_message(&mut h)?;
@@ -1027,7 +1037,7 @@ mod tests {
                                     0,
                                     0,
                                     &w.into_bytes(),
-                                    4096,
+                                    reply_chunk,
                                 ))?;
                                 continue;
                             }
@@ -1038,13 +1048,20 @@ mod tests {
                                     0,
                                     0,
                                     &window.to_be_bytes(),
-                                    4096,
+                                    reply_chunk,
                                 ))?;
                             }
                             let mut w = amf0::Writer::new();
+                            let long_desc = "d".repeat(500);
+                            let desc = if behavior.keep_128_chunks {
+                                long_desc.as_str()
+                            } else {
+                                "ok"
+                            };
                             w.string("_result").number(1.0).object(&[
                                 ("fmsVer", amf0::ObjVal::Str("FMS/3,0,1,123")),
                                 ("capabilities", amf0::ObjVal::Num(31.0)),
+                                ("description", amf0::ObjVal::Str(desc)),
                             ]);
                             h.write_all(&frame_message(
                                 CID_COMMAND,
@@ -1052,7 +1069,7 @@ mod tests {
                                 0,
                                 0,
                                 &w.into_bytes(),
-                                4096,
+                                reply_chunk,
                             ))?;
                         }
                         "createStream" => {
@@ -1060,7 +1077,7 @@ mod tests {
                                 let mut ping = Vec::new();
                                 ping.extend_from_slice(&UCM_PING_REQUEST.to_be_bytes());
                                 ping.extend_from_slice(&1234u32.to_be_bytes());
-                                h.write_all(&frame_message(CID_COMMAND, MSG_USER_CONTROL, 0, 0, &ping, 4096))?;
+                                h.write_all(&frame_message(CID_COMMAND, MSG_USER_CONTROL, 0, 0, &ping, reply_chunk))?;
                             }
                             let mut w = amf0::Writer::new();
                             w.string("_result").number(2.0).null().number(1.0);
@@ -1070,7 +1087,7 @@ mod tests {
                                 0,
                                 0,
                                 &w.into_bytes(),
-                                4096,
+                                reply_chunk,
                             ))?;
                         }
                         "publish" => {
@@ -1091,7 +1108,7 @@ mod tests {
                                 0,
                                 0,
                                 &w.into_bytes(),
-                                4096,
+                                reply_chunk,
                             ))?;
                         }
                         "FCUnpublish" | "closeStream" => {
@@ -1272,6 +1289,20 @@ mod tests {
             .collect();
         assert!(!acks.is_empty(), "client must acknowledge the ack window");
         assert!(acks[0] >= 50, "ack counts received bytes: {}", acks[0]);
+    }
+
+    #[test]
+    fn survives_peer_that_keeps_128_chunk_framing() {
+        // A real ingest server (YouTube) may ignore the client's Set Chunk Size
+        // and keep framing replies in the default 128-byte chunks — including a
+        // `connect` `_result` larger than 128 bytes, which then arrives split.
+        // The client must not assume its negotiated size took effect, or it
+        // will misparse the continuation chunks and stall (`WouldBlock`).
+        let (result, _log) = run_publish(Behavior {
+            keep_128_chunks: true,
+            ..Default::default()
+        });
+        assert!(result.is_ok(), "publish must succeed: {:?}", result.err());
     }
 
     #[test]
