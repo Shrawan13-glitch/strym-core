@@ -2,7 +2,11 @@
 
 /// The ADTS header parsed just enough to rebuild `AudioSpecificConfig` and to
 /// know where the raw frame begins.
+///
+/// Produced by the parser, read by the caller; `non_exhaustive` so new header
+/// attributes can be added in a minor release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AdtsHeader {
     /// profile + 1 (1 = AAC Main, 2 = AAC LC)
     pub object_type: u8,
@@ -47,7 +51,11 @@ pub fn parse_adts(data: &[u8]) -> Option<AdtsHeader> {
 }
 
 /// The 2-byte `AudioSpecificConfig` decoded back into its fields.
+///
+/// Produced by the parser, read by the caller; `non_exhaustive` so new fields
+/// can be added in a minor release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Asc {
     /// AAC object type (1 = Main, 2 = LC, ...), as carried by the ADTS header.
     pub object_type: u8,

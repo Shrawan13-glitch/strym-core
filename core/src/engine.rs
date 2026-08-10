@@ -27,7 +27,11 @@ use crate::transport::Transport;
 
 /// How aggressive the engine is about staying near the live edge when the
 /// transport is slower than the encoder.
+///
+/// `non_exhaustive`: new profiles may be added in a minor release; matches
+/// must keep a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LatencyProfile {
     /// Drop early and often: minimal lag, but may drop frames on weak networks.
     Aggressive,
@@ -87,7 +91,11 @@ impl Default for EngineConfig {
 }
 
 /// Errors surfaced by the engine.
+///
+/// `non_exhaustive`: new failure categories may be added in a minor release;
+/// matches must keep a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EngineError {
     /// FLV muxing failed (missing codec config, ordering violation, or an I/O
     /// failure reported by the transport).
@@ -161,10 +169,18 @@ struct Inner<W: Write> {
 }
 
 /// Public handle. `W` is the transport sink (`Transport`), which also feeds the
-/// muxer. Cloning the engine gives a shared handle (sendable to threads).
-#[derive(Clone)]
+/// muxer. Cloning the engine gives a shared handle (sendable to threads); the
+/// clone happens on the `Arc`, so it never requires `W: Clone`.
 pub struct Engine<W: Transport> {
     inner: Arc<Mutex<Inner<W>>>,
+}
+
+impl<W: Transport> Clone for Engine<W> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl<W: Transport> Engine<W> {

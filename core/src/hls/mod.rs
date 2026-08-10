@@ -19,8 +19,10 @@
 //! The output is a [`crate::sink::PacketSink`]: attach it to the engine with
 //! [`crate::engine::Engine::attach_output`] and it survives reconnects of the
 //! publish path untouched (the playlist simply keeps growing).
-
-pub mod mp4;
+//!
+//! The fMP4 box builder lives in a private `mp4` submodule: [`HlsOutput`] is
+//! the supported interface, so the segment internals stay free to change.
+pub(crate) mod mp4;
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;

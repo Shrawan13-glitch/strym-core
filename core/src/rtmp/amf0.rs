@@ -3,7 +3,11 @@
 //! `_result` / `onStatus` responses. Not a general-purpose codec.
 
 /// Decoded AMF0 value, kept small on purpose.
+///
+/// `non_exhaustive`: new AMF0 markers may be mapped in a minor release;
+/// matches must keep a wildcard arm.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Val {
     /// IEEE-754 double (AMF0's only numeric type).
     Number(f64),
@@ -39,7 +43,11 @@ pub const TYPE_ECMA_ARRAY: u8 = 0x08;
 pub const TYPE_OBJECT_END: u8 = 0x09;
 
 /// A field value inside an AMF0 object.
+///
+/// `non_exhaustive`: new field types may be added in a minor release; matches
+/// must keep a wildcard arm.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum ObjVal<'a> {
     /// IEEE-754 double field.
     Num(f64),

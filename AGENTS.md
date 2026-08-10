@@ -12,7 +12,9 @@ cargo test --all-targets                   # unit + integration tests
 cargo test --release                       # release-mode tests
 ```
 
-Run `cargo fmt` before committing if `cargo fmt --check` fails.
+The workspace root is `core/` (`members = ["ffi"]`), so the commands above also
+cover the `stream-ffi` crate. Run `cargo fmt` before committing if
+`cargo fmt --check` fails.
 
 ## Fuzzing (cargo-fuzz)
 
@@ -66,6 +68,9 @@ git-ignored. CI runs a 5s smoke fuzz per target. `proptest` property tests
 - `tests/pipeline.rs` — end-to-end engine → FLV validation
 - `fuzz/` — cargo-fuzz targets (chunk reassembly, AMF0, FLV, H.264/AAC, RTMP ingest)
 - `examples/` — `flv_demo`, `rtmp_demo`, `dump_hs`
+- `ffi/` — UniFFI (Kotlin/Swift) facade: `StreamSession` object + config/stat
+  records + `StreamListener`/`LogSink` traits; bindings via `generate-bindings.sh`
+  (generated artifacts land in `target/bindings/`, never committed)
 
 ## Plan
 

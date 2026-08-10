@@ -97,7 +97,11 @@ impl RtmpConfig {
 }
 
 /// One decoded RTMP message.
+///
+/// Produced by the reader, consumed by the caller; `non_exhaustive` so new
+/// attributes can be added in a minor release.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Message {
     /// RTMP message type id (1-6 protocol control, 8 audio, 9 video, 18/20 AMF0).
     pub mtype: u8,
@@ -263,7 +267,11 @@ impl Default for ChunkReader {
 }
 
 /// One parsed FLV tag.
+///
+/// Produced by the parser, consumed by the caller; `non_exhaustive` so new
+/// attributes can be added in a minor release.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FlvTag {
     /// FLV tag type: 8 audio, 9 video, 18 script data.
     pub mtype: u8,
@@ -274,7 +282,11 @@ pub struct FlvTag {
 }
 
 /// Why an FLV byte stream was rejected.
+///
+/// `non_exhaustive`: new rejection reasons may be added in a minor release;
+/// matches must keep a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum FlvError {
     /// The FLV header is missing, mis-signed, or carries an unsupported version
     /// or data offset.

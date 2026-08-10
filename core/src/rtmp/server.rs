@@ -71,7 +71,11 @@ impl Default for ServerConfig {
 }
 
 /// What a completed ingest session was: who connected and to which app/key.
+///
+/// Produced by the server, read by the caller; `non_exhaustive` so new
+/// attributes can be added in a minor release.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SessionInfo {
     /// The app name the publisher connected to (validated against the config).
     pub app: String,

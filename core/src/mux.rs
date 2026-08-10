@@ -19,7 +19,11 @@ const FLV_FLAGS: u8 = 0x05;
 
 /// Errors the muxer can produce. Wrapping `io::Error` keeps failures on the
 /// transport (file full, socket closed) distinct from format errors.
+///
+/// `non_exhaustive`: new failure categories may be added in a minor release;
+/// matches must keep a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum MuxError {
     /// The underlying sink failed to accept bytes.
     Io(io::Error),

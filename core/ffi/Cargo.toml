@@ -1,0 +1,25 @@
+[package]
+name = "stream-ffi"
+version = "1.0.0"
+edition = "2021"
+description = "UniFFI (Kotlin/Swift) bindings for the `stream` live-streaming core"
+license = "MIT"
+
+[lib]
+name = "stream_ffi"
+# rlib for Rust tests, cdylib/staticlib for the generated Kotlin/Swift bindings.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+stream = { path = ".." }
+# Bindings generation is an *opt-in* layer: the `stream` core itself remains
+# dependency-free. `cli` provides the bindgen entry point used by
+# `src/bin/uniffi_bindgen.rs`.
+uniffi = { version = "0.32", features = ["cli"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"

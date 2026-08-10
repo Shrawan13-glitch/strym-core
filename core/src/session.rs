@@ -175,7 +175,11 @@ impl Default for SessionPolicy {
 }
 
 /// Where the session currently is.
+///
+/// `non_exhaustive`: new lifecycle states may be added in a minor release;
+/// matches must keep a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionState {
     /// Created but [`start`](Session::start) was never called.
     Idle,
@@ -190,7 +194,11 @@ pub enum SessionState {
 }
 
 /// Errors surfaced by the session.
+///
+/// `non_exhaustive`: new failure categories may be added in a minor release;
+/// matches must keep a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SessionError {
     /// The engine failed while muxing/draining.
     Engine(EngineError),

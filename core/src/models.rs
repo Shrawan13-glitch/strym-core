@@ -7,7 +7,11 @@
 /// The core deliberately works on *encoded* bytes, not raw pixels/samples:
 /// feeding raw YUV/PCM across the FFI boundary would be a realtime bottleneck
 /// and double-buffering nightmare. The platform encodes first.
+///
+/// `non_exhaustive`: new media kinds (e.g. a subtitle or data track) may be
+/// added in a minor release; matches must keep a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum MediaKind {
     /// Compressed video frame.
     Video,
@@ -20,7 +24,12 @@ pub enum MediaKind {
 /// Timestamps are in **milliseconds**, relative to a single shared clock
 /// source (`clock::Clock`). Both `pts` and `dts` are kept so the muxer can
 /// pack the composition-time offset used by players.
+///
+/// `non_exhaustive`: build packets with [`MediaPacket::new`],
+/// [`MediaPacket::video`], or [`MediaPacket::audio`] rather than struct
+/// literals, so new fields can be added in a minor release.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MediaPacket {
     /// Whether this packet carries video or audio.
     pub kind: MediaKind,
@@ -40,26 +49,27 @@ pub struct MediaPacket {
 }
 
 impl MediaPacket {
-    /// Build a video packet; `dts` defaults to `pts` (no B-frame reorder).
-    pub fn video(pts: i64, is_key: bool, data: Vec<u8>) -> Self {
+    /// Build a packet with full control over every field. Use this when
+    /// `dts` differs from `pts` (B-frame reordering); otherwise prefer the
+    /// [`video`](Self::video) / [`audio`](Self::audio) shorthands.
+    pub fn new(kind: MediaKind, pts: i64, dts: i64, is_key: bool, data: Vec<u8>) -> Self {
         Self {
-            kind: MediaKind::Video,
+            kind,
             pts,
-            dts: pts,
+            dts,
             is_key,
             data,
         }
     }
 
+    /// Build a video packet; `dts` defaults to `pts` (no B-frame reorder).
+    pub fn video(pts: i64, is_key: bool, data: Vec<u8>) -> Self {
+        Self::new(MediaKind::Video, pts, pts, is_key, data)
+    }
+
     /// Build an audio packet; `dts` defaults to `pts`.
     pub fn audio(pts: i64, data: Vec<u8>) -> Self {
-        Self {
-            kind: MediaKind::Audio,
-            pts,
-            dts: pts,
-            is_key: false,
-            data,
-        }
+        Self::new(MediaKind::Audio, pts, pts, false, data)
     }
 }
 
@@ -96,7 +106,11 @@ impl Default for StreamConfig {
 /// Summary of how the stream is behaving, surfaced to the platform so it can
 /// react to a weak network (e.g., lower bitrate). A cheaper, counter-level view
 /// than the full [`crate::telemetry::QosSample`]s retained by the collector.
+///
+/// Produced by the core, read by the platform; `non_exhaustive` so new metrics
+/// can be added in a minor release.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct PacketStats {
     /// Packets accepted from the platform.
     pub pushed: u64,

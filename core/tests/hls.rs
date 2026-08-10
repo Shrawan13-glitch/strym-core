@@ -101,7 +101,9 @@ fn demux_flv(path: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>, Vec<stream::mode
             Some(Decoded::VideoConfig(v)) => avcc = Some(v),
             Some(Decoded::AudioConfig(a)) => asc = Some(a),
             Some(Decoded::Packet(p)) => packets.push(p),
-            None => {}
+            // `Decoded` is `non_exhaustive`: unknown future tag kinds (and
+            // undecodable bodies) are ignored.
+            Some(_) | None => {}
         }
     }
     (avcc, asc, packets)

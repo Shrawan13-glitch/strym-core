@@ -1,26 +1,13 @@
-[package]
-name = "stream"
-version = "0.1.0"
-edition = "2021"
-description = "Reusable live-streaming core: sync, mux, transport, buffering"
-license = "MIT"
+# Workspace root: the pure-Rust `stream` core (this package) plus the opt-in
+# UniFFI bindings crate in `ffi/`. The fuzz workspace (`fuzz/`) is standalone.
+[workspace]
+members = ["ffi"]
 
-[lib]
-name = "stream"
-
-[dev-dependencies]
-# Property tests for codec round-trips (Phase 2). Dev-only; never shipped.
-proptest = "1"
-
-[[example]]
-name = "flv_demo"
-path = "examples/flv_demo.rs"
-
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 # Binary-format code packs/ unpacks fixed-width fields constantly; the cast
@@ -36,3 +23,24 @@ missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 many_single_char_names = "allow"
+
+[package]
+name = "stream"
+version = "1.0.0"
+edition = "2021"
+description = "Reusable live-streaming core: sync, mux, transport, buffering"
+license = "MIT"
+
+[lib]
+name = "stream"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# Property tests for codec round-trips (Phase 2). Dev-only; never shipped.
+proptest = "1"
+
+[[example]]
+name = "flv_demo"
+path = "examples/flv_demo.rs"

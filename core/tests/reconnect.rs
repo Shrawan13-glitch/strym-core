@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use stream::engine::EngineConfig;
-use stream::models::{MediaKind, MediaPacket};
+use stream::models::MediaPacket;
 use stream::rtmp::amf0;
 use stream::rtmp::{RtmpConfig, RtmpConnector};
 use stream::session::{ReconnectPolicy, Session, SessionPolicy};
@@ -218,23 +218,11 @@ fn video_frame(pts: i64, is_key: bool) -> MediaPacket {
     let mut data = vec![0u8, 0, 0, 1];
     data.push(if is_key { 0x65 } else { 0x41 });
     data.resize(2048, 0xAB);
-    MediaPacket {
-        kind: MediaKind::Video,
-        pts,
-        dts: pts,
-        is_key,
-        data,
-    }
+    MediaPacket::video(pts, is_key, data)
 }
 
 fn audio_frame(pts: i64) -> MediaPacket {
-    MediaPacket {
-        kind: MediaKind::Audio,
-        pts,
-        dts: pts,
-        is_key: false,
-        data: vec![0x21, 0x00, 0x49, 0x10, 0x04],
-    }
+    MediaPacket::audio(pts, vec![0x21, 0x00, 0x49, 0x10, 0x04])
 }
 
 /// Minimal H.264 `AVCDecoderConfigurationRecord` and AAC `AudioSpecificConfig`.

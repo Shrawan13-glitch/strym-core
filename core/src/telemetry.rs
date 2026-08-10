@@ -27,8 +27,12 @@ const MAX_ERROR_LEN: usize = 512;
 // ---------------------------------------------------------------------------
 
 /// Severity of a log record, ordered so `Error < Warn < Info < Debug < Trace`.
+///
+/// `non_exhaustive`: new severities may be added in a minor release; matches
+/// must keep a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum Level {
     /// The stream is broken or about to be (connect failed, gave up reconnecting).
     Error = 1,
@@ -56,7 +60,11 @@ impl Level {
 }
 
 /// A typed value carried by a [`Field`].
+///
+/// `non_exhaustive`: new value types may be added in a minor release; matches
+/// must keep a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum FieldValue<'a> {
     /// Signed integer.
     Int(i64),
@@ -161,7 +169,11 @@ impl<'a> From<&'a String> for FieldValue<'a> {
 }
 
 /// One structured key/value pair on a log record.
+///
+/// `non_exhaustive`: build fields with [`field`] so new attributes can be
+/// added in a minor release.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Field<'a> {
     /// Attribute name.
     pub key: &'a str,
@@ -181,7 +193,11 @@ where
 }
 
 /// A fully-formed log event handed to a [`Logger`].
+///
+/// Produced by the core, read by the platform's [`Logger`]; `non_exhaustive`
+/// so new record attributes can be added in a minor release.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Record<'a> {
     /// Severity.
     pub level: Level,
@@ -295,7 +311,11 @@ impl Default for QosConfig {
 
 /// One periodic snapshot of stream health. Rates are measured between the
 /// previous sample and this one; counters are cumulative since creation.
+///
+/// Produced by the core, read by the platform; `non_exhaustive` so new metrics
+/// can be added in a minor release.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct QosSample {
     /// Wall-clock milliseconds at sample time (Unix epoch).
     pub wall_ms: u64,
@@ -328,7 +348,11 @@ pub struct QosSample {
 }
 
 /// A discrete lifecycle event, delivered to the event sink as it happens.
+///
+/// `non_exhaustive`: new lifecycle events may be added in a minor release;
+/// matches must keep a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QosEvent {
     /// `Session::start` connected for the first time.
     Started,
@@ -360,7 +384,11 @@ pub enum QosEvent {
 }
 
 /// Queryable summary derived from the retained [`QosSample`] ring.
+///
+/// Produced by the core, read by the platform; `non_exhaustive` so new
+/// aggregates can be added in a minor release.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct QosSummary {
     /// How many samples the summary is based on.
     pub samples: usize,

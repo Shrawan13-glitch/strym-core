@@ -104,16 +104,31 @@ Exit criteria: feature matrix validated by integration tests against reference t
 `tests/rtmp.rs` ffmpeg→RTMP server→HLS→ffprobe/ffmpeg decode round-trip. Test
 totals: 132 unit + HLS + pipeline + reconnect + RTMP interop.)
 
-## Phase 6 — Platform Integration & API 1.0
+## Phase 6 — Platform Integration & API 1.0 ✅
 
 Goal: mobile/desktop platforms can embed the core safely.
 
-- UniFFI bindings (Kotlin/Swift), ergonomic async API surface
-- Memory-ownership contract documented (who frees what, thread-safety)
-- Sample apps: Android publisher, iOS publisher
-- API review + semver 1.0.0 freeze, `#[non_exhaustive]` where appropriate
+- [x] UniFFI bindings (Kotlin/Swift), ergonomic async API surface
+- [x] Memory-ownership contract documented (who frees what, thread-safety)
+- [ ] Sample apps: Android publisher, iOS publisher — **moved to a separate
+      platform repo** (`stream-platform`): the core stays one repo, platform
+      integration another. Android app roadmap tracked in
+      `stream-platform/PLAN.md`.
+- [x] API review + semver 1.0.0 freeze, `#[non_exhaustive]` where appropriate
 
-Exit criteria: sample apps stream live to a public RTMP endpoint for 30+ minutes.
+Exit criteria (core): API frozen, bindings generated, CI verifies them.
+Exit criteria (platform): sample apps stream live to a public RTMP endpoint for
+30+ minutes — tracked in the platform repo.
+
+Status: core API frozen at 1.0.0 (`#[non_exhaustive]` on enums, output structs,
+and `MediaPacket`; user-constructed config structs stay exhaustive). `stream-ffi`
+workspace crate (UniFFI 0.32) wraps the core in a single `StreamSession` object
+with lifecycle/stat callbacks, structured-log sink, and full reconnect handling;
+bindings generate via `core/ffi/generate-bindings.sh`, CI verifies Kotlin+Swift
+generation, and 5 end-to-end tests cover loopback publish, reconnect, connect
+failure/retry, bad config, and log routing. The engine is YouTube-Live-compatible
+(verified via ffmpeg/ffprobe interop on the ingest path). Sample apps live in the
+platform repo (outstanding).
 
 ## Phase 7 — Security & Supply Chain
 

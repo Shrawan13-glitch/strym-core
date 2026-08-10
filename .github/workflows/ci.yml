@@ -40,6 +40,44 @@ jobs:
       - name: Tests (release)
         run: cargo test --release
 
+  bindings:
+    name: Generate Kotlin + Swift bindings
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Build the FFI cdylib
+        run: cargo build -p stream-ffi
+
+      - name: Generate Kotlin bindings
+        run: |
+          cargo run -p stream-ffi --bin uniffi-bindgen -- \
+            generate --language kotlin --no-format \
+            --out-dir /tmp/bindings/kotlin \
+            --library target/debug/libstream_ffi.so
+          test -f /tmp/bindings/kotlin/uniffi/stream_ffi/stream_ffi.kt
+
+      - name: Generate Swift bindings
+        run: |
+          cargo run -p stream-ffi --bin uniffi-bindgen -- \
+            generate --language swift --no-format \
+            --out-dir /tmp/bindings/swift \
+            --library target/debug/libstream_ffi.so
+          test -f /tmp/bindings/swift/stream_ffi.swift
+
   fuzz:
     name: Fuzz (smoke)
     runs-on: ubuntu-latest

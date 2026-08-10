@@ -27,7 +27,11 @@ const VIDEO_CODEC_AVC: u8 = 7;
 const AUDIO_FORMAT_AAC: u8 = 10;
 
 /// What one decoded FLV tag body produced.
+///
+/// `non_exhaustive`: new tag kinds may be added in a minor release; matches
+/// must keep a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Decoded {
     /// An H.264 `AVCDecoderConfigurationRecord` (video sequence header).
     VideoConfig(Vec<u8>),
