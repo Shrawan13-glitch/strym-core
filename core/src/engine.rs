@@ -398,6 +398,15 @@ impl<W: Transport> Engine<W> {
             }
             batch.push(pkt);
         }
+        // The platform pushes video and audio from separate encoder threads,
+        // so the arrival order in the buffer is *delivery* order, not *time*
+        // order: a video encoder that catches up after a stall can deliver a
+        // burst of frames whose timestamps race ahead of the audio that was
+        // captured at the same wall-clock moment. Muxing in arrival order would
+        // then see audio "go backwards" and trip the rebase path on every burst.
+        // Sort on DTS so the muxer always sees globally time-ordered packets
+        // (stable: equal timestamps keep arrival order).
+        batch.sort_by_key(|p| p.dts);
         batch
     }
 
@@ -463,7 +472,12 @@ impl<W: Transport> Engine<W> {
                         // (platform clock reset, encoder restart). Re-anchor and
                         // continue rather than taking the stream down over a
                         // timestamp hiccup.
-                        crate::log_event!(Level::Warn, "clock rebase", "dts" => pkt.dts);
+                        crate::log_event!(
+                            Level::Warn,
+                            "clock rebase",
+                            "kind" => if pkt.kind == MediaKind::Video { "video" } else { "audio" },
+                            "dts" => pkt.dts
+                        );
                         muxer.rebase(pkt.dts);
                         failure = muxer.write_packet(pkt).err();
                         if failure.is_none() {
@@ -694,5 +708,110 @@ impl<W: Transport> Engine<W> {
         // config-tracking snapshot resets along with everything else.
         inner.output_codecs = (None, None);
         crate::log_event!(Level::Info, "engine reset");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::{set_logger, Logger, Record};
+    use std::io;
+    use std::sync::Mutex;
+
+    /// The AAC `AudioSpecificConfig` and H.264 `AVCDecoderConfigurationRecord`.
+    const AVCC: &[u8] = &[
+        0x01, 0x42, 0x00, 0x1F, 0xFF, 0xE1, 0x00, 0x03, 0x67, 0x42, 0x00, 0x0A, 0x01, 0x00, 0x03, 0x68, 0xCE,
+    ];
+    const ASC: &[u8] = &[0x0A, 0x10];
+
+    /// In-memory transport that just records whatever the muxer writes.
+    #[derive(Clone)]
+    struct MemSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for MemSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Transport for MemSink {
+        fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn video(dts: i64, key: bool) -> MediaPacket {
+        MediaPacket::video(dts, key, vec![0, 0, 0, 1, 0x65, 0x88])
+    }
+
+    fn audio(dts: i64) -> MediaPacket {
+        MediaPacket::audio(dts, vec![0x21, 0x00, 0x49, 0x10, 0x04])
+    }
+
+    /// A logger that records the message of every record it receives, so a test
+    /// can assert that a specific event (or its absence) reached the sink.
+    #[derive(Clone)]
+    struct CapturingLogger {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Logger for CapturingLogger {
+        fn log(&self, record: &Record<'_>) {
+            self.messages.lock().unwrap().push(record.message.to_owned());
+        }
+    }
+
+    /// Video and audio pushed from two encoder threads arrive in *delivery*
+    /// order, not time order: here the video frames are all pushed before the
+    /// audio frames that were captured at the same wall-clock moments. The
+    /// engine must mux in DTS order so the muxer never sees audio "go
+    /// backwards" and trip the clock-rebase path.
+    #[test]
+    fn bursty_delivery_is_muxed_in_dts_order_without_rebase() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        set_logger(Some(Arc::new(CapturingLogger {
+            messages: messages.clone(),
+        })));
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let engine = Engine::new(EngineConfig::default());
+        engine.configure_codecs(Some(AVCC), Some(ASC)).unwrap();
+        engine.attach_transport(MemSink { bytes });
+        engine
+            .push_all([
+                // A video encoder that just caught up after a stall delivers a
+                // burst whose timestamps race ahead of the audio captured at the
+                // same real moments.
+                video(0, true),
+                video(33, false),
+                video(66, false),
+                video(99, false),
+                video(132, false),
+                // The audio that *should* interleave between those frames, but
+                // which arrives later in the buffer.
+                audio(21),
+                audio(42),
+                audio(63),
+                audio(84),
+                audio(105),
+            ])
+            .unwrap();
+        let written = engine.tick().unwrap();
+        assert_eq!(written, 10, "every buffered packet must reach the wire");
+
+        let messages = messages.lock().unwrap();
+        assert!(
+            !messages.iter().any(|m| m.contains("clock rebase")),
+            "out-of-order delivery must be sorted, not rebased: {messages:?}"
+        );
+        drop(messages);
+        set_logger(None);
     }
 }

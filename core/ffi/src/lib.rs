@@ -786,8 +786,17 @@ struct LogBridge {
 
 impl Logger for LogBridge {
     fn log(&self, record: &Record<'_>) {
-        self.sink
-            .on_log(record.level.into(), record.module.to_owned(), record.message.to_owned());
+        let mut message = record.message.to_owned();
+        if !record.fields.is_empty() {
+            let fields = record
+                .fields
+                .iter()
+                .map(|f| format!("{}={:?}", f.key, f.value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            message.push_str(&format!(" ({fields})"));
+        }
+        self.sink.on_log(record.level.into(), record.module.to_owned(), message);
     }
 }
 
