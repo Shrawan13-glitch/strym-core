@@ -144,9 +144,10 @@ struct Inner<W: Write> {
     /// headers — the new server connection knows nothing about the old one.
     avcc: Option<Vec<u8>>,
     asc: Option<Vec<u8>>,
-    /// Muxer timebase `(origin, last_dts)` snapshot taken when a transport
-    /// dies, so the replacement muxer continues the timestamp series.
-    timebase: Option<(Option<i64>, i64)>,
+    /// Muxer timebase `(origin, last_video_dts, last_audio_dts)` snapshot taken
+    /// when a transport dies, so the replacement muxer continues the timestamp
+    /// series.
+    timebase: Option<(Option<i64>, i64, i64)>,
     /// Set while the engine must not emit media. True when a transport died
     /// and the buffer held no keyframe to resume from: the fresh connection
     /// would otherwise start on an orphaned inter-frame a decoder cannot use.
@@ -249,8 +250,8 @@ impl<W: Transport> Engine<W> {
         let mut inner = self.lock();
         let old = inner.muxer.take().map(super::mux::FlvMuxer::into_inner);
         let mut muxer = FlvMuxer::new(transport);
-        if let Some((origin, last_dts)) = inner.timebase.take() {
-            muxer.restore_timebase(origin, last_dts);
+        if let Some((origin, last_video, last_audio)) = inner.timebase.take() {
+            muxer.restore_timebase(origin, last_video, last_audio);
         }
         inner.muxer = Some(muxer);
         inner.metadata_written = false;
@@ -274,7 +275,7 @@ impl<W: Transport> Engine<W> {
         // for re-emitting sequence headers on the next connection.
         let snapshot = inner.muxer.as_ref().map(|m| {
             (
-                (m.origin(), m.last_dts()),
+                (m.origin(), m.last_dts(MediaKind::Video), m.last_dts(MediaKind::Audio)),
                 m.video_config().map(<[u8]>::to_vec),
                 m.audio_config().map(<[u8]>::to_vec),
             )
@@ -478,7 +479,7 @@ impl<W: Transport> Engine<W> {
                             "kind" => if pkt.kind == MediaKind::Video { "video" } else { "audio" },
                             "dts" => pkt.dts
                         );
-                        muxer.rebase(pkt.dts);
+                        muxer.rebase(pkt.kind, pkt.dts);
                         failure = muxer.write_packet(pkt).err();
                         if failure.is_none() {
                             sent += 1;

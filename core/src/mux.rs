@@ -71,6 +71,50 @@ struct InitState {
 /// stream stays monotonic; anything further back is a real error.
 const REORDER_TOLERANCE_MS: i64 = 100;
 
+/// Per-track DTS high-water marks.
+///
+/// Audio and video are independent decode timelines: RTMP carries them on
+/// separate chunk streams with absolute timestamps, and FLV players merge
+/// tags by timestamp — nothing on the wire requires the two tracks to be
+/// globally interleaved in increasing order. Each track therefore enforces
+/// monotonicity against *itself only*, so one track bursting ahead of the
+/// other (a stalled encoder catching up) is ordinary interleaving, not an
+/// ordering violation.
+#[derive(Clone, Copy)]
+struct TrackDts {
+    video: i64,
+    audio: i64,
+}
+
+impl TrackDts {
+    fn new() -> Self {
+        Self {
+            video: i64::MIN,
+            audio: i64::MIN,
+        }
+    }
+
+    fn get(&self, kind: MediaKind) -> i64 {
+        match kind {
+            MediaKind::Video => self.video,
+            MediaKind::Audio => self.audio,
+        }
+    }
+
+    fn set(&mut self, kind: MediaKind, value: i64) {
+        match kind {
+            MediaKind::Video => self.video = value,
+            MediaKind::Audio => self.audio = value,
+        }
+    }
+
+    /// Highest DTS written on either track — the watermark header-style tags
+    /// must never sit below.
+    fn max(&self) -> i64 {
+        self.video.max(self.audio)
+    }
+}
+
 /// A writer for FLV tags into a byte sink.
 pub struct FlvMuxer<W: Write> {
     sink: W,
@@ -78,8 +122,9 @@ pub struct FlvMuxer<W: Write> {
     /// clock offset: first timestamp seen becomes 0 so streams don't start at
     /// a huge value after long uptime.
     origin: Option<i64>,
-    /// Most recent normalized DTS written; enforces monotonic output.
-    last_dts: i64,
+    /// Most recent normalized DTS written, per track; enforces per-track
+    /// monotonic output.
+    last_dts: TrackDts,
     /// H.264 `AVCDecoderConfigurationRecord` last emitted (or sniffed), kept so
     /// a reconnect can re-send the sequence header — servers forget it.
     avcc: Option<Vec<u8>>,
@@ -97,7 +142,7 @@ impl<W: Write> FlvMuxer<W> {
             sink,
             state: InitState::default(),
             origin: None,
-            last_dts: i64::MIN,
+            last_dts: TrackDts::new(),
             avcc: None,
             asc: None,
             bytes_written: 0,
@@ -124,26 +169,29 @@ impl<W: Write> FlvMuxer<W> {
         self.origin
     }
 
-    /// Most recent normalized DTS written (`i64::MIN` before the first packet).
-    pub fn last_dts(&self) -> i64 {
-        self.last_dts
+    /// Most recent normalized DTS written on the given track (`i64::MIN`
+    /// before that track's first packet).
+    pub fn last_dts(&self, kind: MediaKind) -> i64 {
+        self.last_dts.get(kind)
     }
 
     /// Carry the timebase over from a previous muxer (reconnect). Keeping the
-    /// same origin and high-water mark means the resumed stream continues the
+    /// same origin and high-water marks means the resumed stream continues the
     /// timestamp series instead of jumping back to 0 — viewers see one stream,
     /// not a restart.
-    pub fn restore_timebase(&mut self, origin: Option<i64>, last_dts: i64) {
+    pub fn restore_timebase(&mut self, origin: Option<i64>, last_video_dts: i64, last_audio_dts: i64) {
         self.origin = origin;
-        self.last_dts = last_dts;
+        self.last_dts.video = last_video_dts;
+        self.last_dts.audio = last_audio_dts;
     }
 
     /// Re-anchor the origin so `dts` normalizes to exactly the last written
-    /// DTS. This is the clock-drift escape hatch: when the capture clock jumps
-    /// backwards beyond tolerance (platform clock reset, encoder restart),
-    /// output stays monotonic instead of erroring.
-    pub fn rebase(&mut self, dts: i64) {
-        self.origin = Some(dts - self.last_dts.max(0));
+    /// DTS on `dts`'s own track. This is the clock-drift escape hatch: when a
+    /// capture clock jumps backwards beyond tolerance (platform clock reset,
+    /// encoder restart), output stays monotonic instead of erroring.
+    pub fn rebase(&mut self, kind: MediaKind, dts: i64) {
+        let anchor = self.last_dts.get(kind).max(0);
+        self.origin = Some(dts - anchor);
     }
 
     /// The H.264 decoder configuration in force, if video has been configured.
@@ -198,7 +246,7 @@ impl<W: Write> FlvMuxer<W> {
     /// Before media flows that's 0; after a reconnect it's the point the stream
     /// reached, so re-emitted headers never violate timestamp monotonicity.
     fn header_ts(&self) -> i64 {
-        self.last_dts.max(0)
+        self.last_dts.max().max(0)
     }
 
     /// Emit the script-data tag (`onMetaData`) with stream info. Called once,
@@ -276,21 +324,27 @@ impl<W: Write> FlvMuxer<W> {
         }
 
         let ts = self.normalize(pkt.dts);
-        let ts = if ts < self.last_dts {
-            let slip = self.last_dts - ts;
+        // Ordering is enforced per track: a track only ever competes with its
+        // own past. Cross-track staleness (audio bursting in behind video that
+        // raced ahead while the audio encoder was stalled) is normal
+        // interleaving — the wire carries absolute timestamps on separate
+        // chunk streams, and players merge tags by timestamp.
+        let track_last = self.last_dts.get(pkt.kind);
+        let ts = if ts < track_last {
+            let slip = track_last - ts;
             if slip > REORDER_TOLERANCE_MS {
                 return Err(MuxError::Ordering(format!(
-                    "DTS went backwards by {slip} ms ({} -> {}); out of tolerance",
-                    self.last_dts, ts
+                    "{:?} DTS went backwards by {slip} ms ({} -> {}); out of tolerance",
+                    pkt.kind, track_last, ts
                 )));
             }
             // Small backward slip (encoder jitter): clamp to keep the emitted
             // stream monotonic. FLV players can't decode backward timestamps.
-            self.last_dts
+            track_last
         } else {
             ts
         };
-        self.last_dts = ts;
+        self.last_dts.set(pkt.kind, ts);
         let pts = self.normalize(pkt.pts);
         let cts = pts.saturating_sub(ts);
 
@@ -500,10 +554,10 @@ mod tests {
         let (mut m, _) = muxer();
         m.write_packet(&video(0, 0, true)).unwrap();
         m.write_packet(&video(5000, 5000, false)).unwrap();
-        let (origin, last) = (m.origin(), m.last_dts());
+        let (origin, last) = (m.origin(), m.last_dts(MediaKind::Video));
 
         let mut resumed = FlvMuxer::new(Vec::new());
-        resumed.restore_timebase(origin, last);
+        resumed.restore_timebase(origin, last, i64::MIN);
         resumed.write_packet(&video(5040, 5040, false)).unwrap();
         let bytes = resumed.into_inner();
         let tags = parse(&bytes);
@@ -518,7 +572,7 @@ mod tests {
         m.write_packet(&video(10_000, 10_000, false)).unwrap();
         // Capture clock resets far backwards: rebasing continues from the
         // high-water mark instead of an ordering error.
-        m.rebase(40);
+        m.rebase(MediaKind::Video, 40);
         m.write_packet(&video(40, 40, true)).unwrap();
         m.write_packet(&video(80, 80, false)).unwrap();
         let bytes = m.into_inner();
@@ -526,6 +580,68 @@ mod tests {
         let ts: Vec<u32> = tags.iter().map(|t| t.1).collect();
         assert!(ts.windows(2).all(|w| w[0] <= w[1]), "monotonic: {ts:?}");
         assert_eq!(*ts.last().unwrap(), 10_040);
+    }
+
+    #[test]
+    fn stale_track_beyond_tolerance_interleaves_without_error() {
+        // The field failure this guards against: video raced ahead (its encoder
+        // kept running) while audio stalled, then the audio burst arrived
+        // ~300 ms behind the muxed video high-water. Tracks are independent
+        // timelines, so this is interleaving — not an ordering violation.
+        let (mut m, _) = muxer();
+        m.write_packet(&video(0, 0, true)).unwrap();
+        m.write_packet(&audio(40)).unwrap();
+        m.write_packet(&video(1000, 1000, false)).unwrap();
+        m.write_packet(&audio(700)).unwrap();
+        let bytes = m.into_inner();
+        let tags = parse(&bytes);
+        // Both frames made it to the wire with their own (normalized) times.
+        // Skip the leading AAC sequence header (emitted by init_codecs).
+        let atags: Vec<u32> = tags
+            .iter()
+            .filter(|(k, _, _)| *k == TAG_AUDIO)
+            .map(|t| t.1)
+            .skip(1)
+            .collect();
+        assert_eq!(atags, vec![40, 700]);
+    }
+
+    #[test]
+    fn per_track_ordering_is_still_enforced() {
+        // Cross-track staleness is fine; a track regressing against *itself*
+        // beyond tolerance remains a real error (clock reset territory).
+        let (mut m, _) = muxer();
+        m.write_packet(&audio(0)).unwrap();
+        m.write_packet(&audio(1000)).unwrap();
+        let err = m.write_packet(&audio(700)).unwrap_err();
+        assert!(matches!(err, MuxError::Ordering(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rebase_anchors_to_its_own_track() {
+        // An audio clock reset rebases on audio's high-water mark; video's
+        // timeline keeps flowing independently.
+        let (mut m, _) = muxer();
+        m.write_packet(&video(0, 0, true)).unwrap();
+        m.write_packet(&audio(0)).unwrap();
+        m.write_packet(&audio(2000)).unwrap();
+        m.write_packet(&video(3000, 3000, false)).unwrap();
+        // Audio's capture clock resets far backwards: the next audio frame
+        // must continue exactly from audio's own watermark (2000), while
+        // video stays untouched at 3000.
+        m.rebase(MediaKind::Audio, 2100);
+        m.write_packet(&audio(2100)).unwrap();
+        let bytes = m.into_inner();
+        let tags = parse(&bytes);
+        let atags: Vec<u32> = tags
+            .iter()
+            .filter(|(k, _, _)| *k == TAG_AUDIO)
+            .map(|t| t.1)
+            .skip(1)
+            .collect();
+        let vtags: Vec<u32> = tags.iter().filter(|(k, _, _)| *k == TAG_VIDEO).map(|t| t.1).collect();
+        assert_eq!(atags, vec![0, 2000, 2000]);
+        assert_eq!(*vtags.last().unwrap(), 3000);
     }
 
     #[test]
@@ -543,11 +659,11 @@ mod tests {
         let (mut m, cfg) = muxer();
         m.write_packet(&video(0, 0, true)).unwrap();
         m.write_packet(&video(3000, 3000, false)).unwrap();
-        let (origin, last) = (m.origin(), m.last_dts());
+        let (origin, last) = (m.origin(), m.last_dts(MediaKind::Video));
         let (avcc, asc) = (m.video_config().unwrap().to_vec(), m.audio_config().unwrap().to_vec());
 
         let mut resumed = FlvMuxer::new(Vec::new());
-        resumed.restore_timebase(origin, last);
+        resumed.restore_timebase(origin, last, i64::MIN);
         resumed.write_metadata(&cfg).unwrap();
         resumed.write_video_sequence(&avcc).unwrap();
         resumed.write_audio_sequence(&asc).unwrap();

@@ -122,7 +122,7 @@ impl<W: Transport + Send> PacketSink for RecordingOutput<W> {
             // Mirror the engine's escape hatch: a capture-clock jump re-anchors
             // the recording instead of killing it.
             Err(MuxError::Ordering(_)) => {
-                self.muxer.rebase(pkt.dts);
+                self.muxer.rebase(pkt.kind, pkt.dts);
                 self.muxer.write_packet(pkt)
             }
             Err(e) => Err(e),
