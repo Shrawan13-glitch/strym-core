@@ -41,6 +41,8 @@ const MSG_AMF0_COMMAND: u8 = 20;
 // User Control Message events (payload: u16 event + event data).
 const UCM_PING_REQUEST: u16 = 0;
 const UCM_PING_RESPONSE: u16 = 1;
+/// User Control event `Acknowledgement` (spec: the peer's byte counter).
+const UCM_ACK: u16 = 3;
 
 /// Chunk size we negotiate to after the handshake. Matches the value common RTMP
 /// servers (node-media-server, nginx-rtmp, SRS) expect/serve.
@@ -81,6 +83,33 @@ pub struct RtmpConfig {
     /// Read/write timeout for every socket operation. Defaults to
     /// [`DEFAULT_TIMEOUT`]; `None` blocks indefinitely.
     pub timeout: Option<Duration>,
+    /// Liveness budget: how long the connection may hear *nothing* from the
+    /// server (no acknowledgements, no pings, no traffic) while we keep
+    /// publishing, before the watchdog declares the peer dead. Pings are
+    /// sent at a quarter of this interval; three unanswered pings trip the
+    /// watchdog. This is what detects the half-open zombie — a vanished peer
+    /// whose kernel keeps accepting our writes locally. `None` disables the
+    /// watchdog. Defaults to [`DEFAULT_WATCHDOG_IDLE`].
+    pub watchdog_idle: Option<Duration>,
+}
+
+/// Default liveness budget for [`RtmpConfig::watchdog_idle`]: long enough to
+/// ride out a quiet-but-alive server (nginx's default ping interval alone is
+/// 60 s, but any server that acks or answers our probes resets it), short
+/// enough that a zombie costs at most ~12 s of buffered media before the
+/// session redials.
+pub const DEFAULT_WATCHDOG_IDLE: Duration = Duration::from_secs(12);
+
+impl Default for RtmpConfig {
+    fn default() -> Self {
+        Self {
+            app: String::new(),
+            key: String::new(),
+            tc_url: String::new(),
+            timeout: Some(DEFAULT_TIMEOUT),
+            watchdog_idle: Some(DEFAULT_WATCHDOG_IDLE),
+        }
+    }
 }
 
 impl RtmpConfig {
@@ -92,6 +121,7 @@ impl RtmpConfig {
             key: key.into(),
             tc_url: tc_url.into(),
             timeout: Some(DEFAULT_TIMEOUT),
+            watchdog_idle: Some(DEFAULT_WATCHDOG_IDLE),
         }
     }
 }
@@ -431,6 +461,40 @@ pub struct RtmpTransport<S: Read + Write> {
     bytes_written: u64,
     /// Latest measured round-trip time to the server, refreshed per connection.
     rtt: Option<Duration>,
+    /// The server's byte counter as of its latest `Acknowledgement` event —
+    /// proof bytes are actually leaving our send buffer. Wraps mod 2^32.
+    peer_acked: u64,
+    /// When inbound traffic was last parsed from the server (any message:
+    /// acks, pings, command replies). The liveness watchdog reads this.
+    last_inbound: Instant,
+    /// Liveness probes sent since the last inbound message. Three unanswered
+    /// probes declare the peer dead (see [`RtmpConfig::watchdog_idle`]).
+    pings_without_reply: u32,
+    /// Earliest instant the next liveness probe may go out (one per quarter
+    /// of the watchdog budget).
+    next_probe_at: Instant,
+}
+
+/// Socket read-timeout control, so [`RtmpTransport::maintain`] can drain the
+/// inbound direction without blocking the publisher loop. Implemented for
+/// real sockets; test doubles stub it alongside their `Read`.
+pub trait ReadTimeoutControl: Read + Write {
+    /// Apply a read timeout: `Some(Duration::ZERO)` drains whatever is
+    /// already available without blocking; `Some(d)` / `None` restore normal
+    /// (timeout / blocking) behavior.
+    fn apply_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl ReadTimeoutControl for TcpStream {
+    fn apply_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        // std rejects an exact-zero socket timeout; a 1 ms read timeout is
+        // the portable equivalent for draining what's already buffered.
+        let effective = match timeout {
+            Some(Duration::ZERO) => Some(Duration::from_millis(1)),
+            other => other,
+        };
+        self.set_read_timeout(effective)
+    }
 }
 
 impl RtmpTransport<TcpStream> {
@@ -470,6 +534,7 @@ impl RtmpTransport<TcpStream> {
             for _ in 0..MAX_PENDING_MESSAGES {
                 let msg = self.reader.read_message(&mut self.sock)?;
                 self.last_activity = Instant::now();
+                self.note_inbound();
                 self.maybe_send_ack()?;
                 if msg.mtype == MSG_USER_CONTROL && msg.payload.len() >= 6 {
                     let event = u16::from_be_bytes([msg.payload[0], msg.payload[1]]);
@@ -500,7 +565,7 @@ impl RtmpTransport<TcpStream> {
     }
 }
 
-impl<S: Read + Write> RtmpTransport<S> {
+impl<S: ReadTimeoutControl> RtmpTransport<S> {
     /// Perform the full publish handshake over `sock`, then return a ready
     /// transport.
     pub fn connect(mut sock: S, cfg: RtmpConfig) -> io::Result<Self> {
@@ -537,6 +602,10 @@ impl<S: Read + Write> RtmpTransport<S> {
             last_activity: Instant::now(),
             bytes_written: 0,
             rtt: None,
+            peer_acked: 0,
+            last_inbound: Instant::now(),
+            pings_without_reply: 0,
+            next_probe_at: Instant::now(),
         };
         // Tell the server to expect our larger chunks (and match its own). Sent
         // right after the handshake, before the first command. The *inbound*
@@ -654,6 +723,7 @@ impl<S: Read + Write> RtmpTransport<S> {
         loop {
             let msg = self.reader.read_message(&mut self.sock)?;
             self.last_activity = Instant::now();
+            self.note_inbound();
             self.maybe_send_ack()?;
             match msg.mtype {
                 MSG_AMF0_COMMAND | MSG_AMF0_DATA => {
@@ -690,14 +760,29 @@ impl<S: Read + Write> RtmpTransport<S> {
             }
             MSG_USER_CONTROL if p.len() >= 2 => {
                 let event = u16::from_be_bytes([p[0], p[1]]);
-                if event == UCM_PING_REQUEST && p.len() >= 6 {
-                    let ts = u32::from_be_bytes([p[2], p[3], p[4], p[5]]);
-                    self.send_ping_response(ts)?;
+                match event {
+                    UCM_PING_REQUEST if p.len() >= 6 => {
+                        let ts = u32::from_be_bytes([p[2], p[3], p[4], p[5]]);
+                        self.send_ping_response(ts)?;
+                    }
+                    // The server's receive counter: proof our bytes are
+                    // leaving the local send buffer and being consumed.
+                    UCM_ACK if p.len() >= 6 => {
+                        self.peer_acked = u64::from(u32::from_be_bytes([p[2], p[3], p[4], p[5]]));
+                    }
+                    _ => {}
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Record proof of an alive peer. Called for every inbound message.
+    fn note_inbound(&mut self) {
+        self.last_inbound = Instant::now();
+        self.pings_without_reply = 0;
+        self.next_probe_at = Instant::now() + self.cfg.watchdog_idle.unwrap_or_default() / 4;
     }
 
     /// Send an acknowledgement once a full window has been received since the
@@ -761,7 +846,7 @@ impl<S: Read + Write> RtmpTransport<S> {
     }
 }
 
-impl<S: Read + Write> io::Write for RtmpTransport<S> {
+impl<S: ReadTimeoutControl> io::Write for RtmpTransport<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let tags = self.flv.feed(buf).map_err(|e| invalid(e.to_string()))?;
         for tag in &tags {
@@ -774,7 +859,7 @@ impl<S: Read + Write> io::Write for RtmpTransport<S> {
     }
 }
 
-impl<S: Read + Write> crate::transport::Transport for RtmpTransport<S> {
+impl<S: ReadTimeoutControl> crate::transport::Transport for RtmpTransport<S> {
     fn shutdown(&mut self) -> io::Result<()> {
         // Best-effort unpublish so the server tears down the ingest cleanly.
         let mut w = amf0::Writer::new();
@@ -801,6 +886,77 @@ impl<S: Read + Write> crate::transport::Transport for RtmpTransport<S> {
 
     fn rtt(&self) -> Option<Duration> {
         self.rtt
+    }
+
+    fn maintain(&mut self) -> io::Result<()> {
+        // 1. Drain whatever the server has sent (acks, pings, control
+        //    traffic). Every parsed message is proof of life.
+        let saved = self.cfg.timeout;
+        self.sock.apply_read_timeout(Some(Duration::ZERO))?;
+        let drain: io::Result<()> = loop {
+            match self.reader.read_message(&mut self.sock) {
+                Ok(msg) => {
+                    self.last_activity = Instant::now();
+                    self.note_inbound();
+                    if let Err(e) = self.maybe_send_ack() {
+                        break Err(e);
+                    }
+                    if let Err(e) = self.handle_control(&msg) {
+                        break Err(e);
+                    }
+                }
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                    break Ok(());
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        self.sock.apply_read_timeout(saved)?;
+        drain?;
+
+        // 2. Liveness watchdog. A vanished peer keeps "accepting" writes in
+        // the kernel send buffer, so the write path alone can stay green for
+        // many minutes while the server sees nothing. Only inbound traffic
+        // proves the peer is alive; when none arrives we elicit it with ping
+        // probes and give up after three go unanswered.
+        let Some(budget) = self.cfg.watchdog_idle else {
+            return Ok(());
+        };
+        let silent_for = self.last_inbound.elapsed();
+        if silent_for < budget / 4 {
+            return Ok(());
+        }
+        if self.pings_without_reply >= MAX_UNANSWERED_PINGS && silent_for >= budget {
+            let probes = self.pings_without_reply;
+            return Err(invalid(format!(
+                "publisher watchdog: no server traffic for {silent_for:?} ({probes} unanswered probes)"
+            )));
+        }
+        if self.pings_without_reply < MAX_UNANSWERED_PINGS && Instant::now() >= self.next_probe_at {
+            self.send_ping_probe()?;
+            self.next_probe_at = Instant::now() + budget / 4;
+        }
+        Ok(())
+    }
+}
+
+/// Liveness probes that may go unanswered before [`RtmpTransport::maintain`]
+/// declares the peer dead.
+const MAX_UNANSWERED_PINGS: u32 = 3;
+
+impl<S: ReadTimeoutControl> RtmpTransport<S> {
+    /// Send one liveness probe, throttled to one per quarter of the watchdog
+    /// budget so a slow tick cadence cannot spam the server. The counter only
+    /// advances here; `note_inbound` clears it.
+    fn send_ping_probe(&mut self) -> io::Result<()> {
+        self.pings_without_reply += 1;
+        let sent = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| (d.as_millis() % u128::from(u32::MAX)) as u32);
+        let mut payload = Vec::with_capacity(6);
+        payload.extend_from_slice(&UCM_PING_REQUEST.to_be_bytes());
+        payload.extend_from_slice(&sent.to_be_bytes());
+        self.send_message(CID_COMMAND, MSG_USER_CONTROL, 0, 0, &payload)
     }
 }
 
@@ -933,14 +1089,24 @@ mod tests {
         tx: mpsc::Sender<Vec<u8>>,
         rx: mpsc::Receiver<Vec<u8>>,
         buf: Vec<u8>,
+        drain_mode: bool,
     }
 
     impl IoRead for Half {
         fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
             if self.buf.is_empty() {
-                match self.rx.recv() {
-                    Ok(chunk) => self.buf = chunk,
-                    Err(_) => return Ok(0),
+                if self.drain_mode {
+                    // Non-blocking pass: no buffered data and nothing queued
+                    // means "nothing available right now".
+                    match self.rx.try_recv() {
+                        Ok(chunk) => self.buf = chunk,
+                        Err(_) => return Err(io::Error::new(io::ErrorKind::WouldBlock, "drain")),
+                    }
+                } else {
+                    match self.rx.recv() {
+                        Ok(chunk) => self.buf = chunk,
+                        Err(_) => return Ok(0),
+                    }
                 }
             }
             let n = out.len().min(self.buf.len());
@@ -962,6 +1128,16 @@ mod tests {
         }
     }
 
+    /// Zero-timeout mode flag so the watchdog's inbound drain can be exercised
+    /// against the in-memory duplex: in drain mode an empty channel behaves
+    /// like a socket with nothing to read (`WouldBlock`), never a block.
+    impl super::ReadTimeoutControl for Half {
+        fn apply_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+            self.drain_mode = timeout == Some(Duration::ZERO);
+            Ok(())
+        }
+    }
+
     fn pair() -> (Half, Half) {
         let (a_tx, a_rx) = mpsc::channel::<Vec<u8>>();
         let (b_tx, b_rx) = mpsc::channel::<Vec<u8>>();
@@ -970,11 +1146,13 @@ mod tests {
                 tx: a_tx,
                 rx: b_rx,
                 buf: Vec::new(),
+                drain_mode: false,
             },
             Half {
                 tx: b_tx,
                 rx: a_rx,
                 buf: Vec::new(),
+                drain_mode: false,
             },
         )
     }
@@ -1315,6 +1493,89 @@ mod tests {
             ..Default::default()
         });
         assert!(result.is_ok(), "publish must succeed: {:?}", result.err());
+    }
+
+    #[test]
+    fn watchdog_trips_on_silent_peer() {
+        // The half-open zombie: writes keep succeeding into the kernel buffer
+        // while the vanished server sends nothing. The watchdog must declare
+        // the peer dead within its budget instead of letting the session sit
+        // on a corpse connection ("reconnected" but viewers spin forever).
+        let (client_half, server_half) = pair();
+        let log: MsgLog = Arc::new(Mutex::new(Vec::new()));
+        let server = thread::spawn(move || {
+            // The plain fake server never replies to user-control probes, so
+            // once the control plane completes the peer is protocol-silent.
+            let _ = fake_server(server_half, &Behavior::default(), &log);
+        });
+        let cfg = RtmpConfig {
+            watchdog_idle: Some(Duration::from_millis(300)),
+            ..RtmpConfig::new("app", "myStream", "rtmp://localhost/app")
+        };
+        let mut t = RtmpTransport::connect(client_half, cfg).expect("connect");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let outcome = loop {
+            match Transport::maintain(&mut t) {
+                Ok(()) => {
+                    assert!(Instant::now() < deadline, "watchdog never tripped");
+                    // Keep publishing like the real pump would; the zombie
+                    // accepts everything without complaint.
+                    let _ = t.write_all(&[0u8; 64]);
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => break e,
+            }
+        };
+        assert!(
+            outcome.to_string().contains("watchdog"),
+            "expected the watchdog, got: {outcome}"
+        );
+        let _ = Transport::shutdown(&mut t);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn watchdog_stays_quiet_while_probes_are_answered() {
+        // A live server answers ping probes (or sends traffic of its own);
+        // every answer resets the liveness clock and maintain must never err.
+        let (c_tx, s_rx) = mpsc::channel::<Vec<u8>>();
+        let (s_tx, c_rx) = mpsc::channel::<Vec<u8>>();
+        let client_half = Half {
+            tx: c_tx,
+            rx: c_rx,
+            buf: Vec::new(),
+            drain_mode: false,
+        };
+        let server_half = Half {
+            tx: s_tx.clone(),
+            rx: s_rx,
+            buf: Vec::new(),
+            drain_mode: false,
+        };
+        let log: MsgLog = Arc::new(Mutex::new(Vec::new()));
+        let server = thread::spawn(move || {
+            let _ = fake_server(server_half, &Behavior::default(), &log);
+        });
+        let cfg = RtmpConfig {
+            watchdog_idle: Some(Duration::from_millis(300)),
+            ..RtmpConfig::new("app", "myStream", "rtmp://localhost/app")
+        };
+        let mut t = RtmpTransport::connect(client_half, cfg).expect("connect");
+
+        // Answering server: one ping request every 60 ms, well within the
+        // quarter-budget probe cadence.
+        let deadline = Instant::now() + Duration::from_millis(900);
+        while Instant::now() < deadline {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&UCM_PING_REQUEST.to_be_bytes());
+            payload.extend_from_slice(&0u32.to_be_bytes());
+            s_tx.send(frame_message(CID_COMMAND, MSG_USER_CONTROL, 0, 0, &payload, 4096))
+                .unwrap();
+            Transport::maintain(&mut t).expect("live peer must pass the watchdog");
+            thread::sleep(Duration::from_millis(30));
+        }
+        let _ = Transport::shutdown(&mut t);
+        let _ = server.join();
     }
 
     #[test]

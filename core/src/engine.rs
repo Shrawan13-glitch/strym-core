@@ -444,6 +444,11 @@ impl<W: Transport> Engine<W> {
         if inner.muxer.is_none() {
             return Ok(0);
         }
+        // Service the transport's inbound direction / health checks first:
+        // a dead peer must be discovered before more bytes are fed to it.
+        if let Some(m) = inner.muxer.as_mut() {
+            m.sink_mut().maintain()?;
+        }
         // Drain the buffer first; collect so we never hold two borrows at once.
         let mut batch = Self::drain_for_mux(&mut inner);
         let need_metadata = !inner.metadata_written;
@@ -746,6 +751,47 @@ mod tests {
         fn shutdown(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Transport whose inbound health check always fails — models the
+    /// half-open zombie the watchdog detects.
+    struct DeadPeerSink(MemSink);
+
+    impl io::Write for DeadPeerSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl Transport for DeadPeerSink {
+        fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn maintain(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "publisher watchdog: peer is dead",
+            ))
+        }
+    }
+
+    #[test]
+    fn failed_maintain_fails_the_tick_without_muxing() {
+        // A transport that reports its peer dead during maintain must fail
+        // the tick (so the session reconnects) and must not have written
+        // anything on this pass.
+        let sink = DeadPeerSink(MemSink {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+        });
+        let engine: Engine<DeadPeerSink> = Engine::new(EngineConfig::default());
+        engine.attach_transport(sink);
+        engine.configure_codecs(Some(AVCC), Some(ASC)).unwrap();
+        engine.push(video(0, true)).unwrap();
+        let err = engine.tick().unwrap_err();
+        assert!(err.to_string().contains("watchdog"), "got: {err}");
     }
 
     fn video(dts: i64, key: bool) -> MediaPacket {

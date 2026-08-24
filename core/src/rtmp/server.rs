@@ -744,6 +744,12 @@ mod tests {
         }
     }
 
+    impl crate::rtmp::ReadTimeoutControl for Half {
+        fn apply_read_timeout(&mut self, _timeout: Option<std::time::Duration>) -> io::Result<()> {
+            Ok(()) // the in-memory duplex is already non-blocking-ish for tests
+        }
+    }
+
     fn pair() -> (Half, Half) {
         let (a_tx, a_rx) = mpsc::channel::<Vec<u8>>();
         let (b_tx, b_rx) = mpsc::channel::<Vec<u8>>();

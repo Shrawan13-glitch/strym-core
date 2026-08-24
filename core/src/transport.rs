@@ -35,6 +35,20 @@ pub trait Transport: io::Write {
     fn rtt(&self) -> Option<Duration> {
         None
     }
+
+    /// Service the connection's inbound direction and run its own health
+    /// checks. Called by the engine once per tick, *before* muxing, so a
+    /// dead peer is discovered here rather than after more bytes were fed
+    /// into a socket nobody is reading. An error is a transport failure like
+    /// any write error: the session tears down and reconnects.
+    ///
+    /// This is what catches the half-open zombie: the kernel happily buffers
+    /// local writes to a peer that vanished, so `write` keeps "succeeding"
+    /// while nothing reaches the server. Only the inbound side (acknowledge-
+    /// ments, pings) proves the peer is alive.
+    fn maintain(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Writes bytes to a local file — the simplest transport, used by tests and
@@ -206,6 +220,33 @@ impl io::Write for Fanout {
 }
 
 impl Transport for Fanout {
+    fn maintain(&mut self) -> io::Result<()> {
+        // Mirror the write semantics: the primary's health decides the
+        // fanout's, secondaries retire quietly on their own failures.
+        let mut primary_error = None;
+        for (idx, slot) in self.slots.iter_mut().enumerate() {
+            if !slot.alive {
+                continue;
+            }
+            if let Err(e) = slot.transport.maintain() {
+                if idx == 0 {
+                    primary_error = Some(e);
+                } else {
+                    slot.alive = false;
+                    crate::log_event!(
+                        crate::telemetry::Level::Warn,
+                        "fanout secondary retired",
+                        "error" => e.to_string().as_str()
+                    );
+                }
+            }
+        }
+        match primary_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     fn shutdown(&mut self) -> io::Result<()> {
         // Shut down every sink; the first failure is reported, the rest are
         // still closed so no endpoint is left hanging.
