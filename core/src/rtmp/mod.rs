@@ -66,8 +66,11 @@ const MAX_FLV_DATA_OFFSET: usize = 4096;
 /// so a dead peer can never hang the publisher forever.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-// Chunk stream ids we emit on: commands/data=3, audio=6, video=7.
+// Chunk stream ids we emit on: commands/data=3, source publish=4, audio=6, video=7.
+// Matches librtmp (0x04 for publish) and pedro's OVER_STREAM (0x05) — both are
+// accepted; we use 0x04 for publish to mirror librtmp/OBS.
 const CID_COMMAND: u8 = 3;
+const CID_PUBLISH: u8 = 4;
 const CID_AUDIO: u8 = 6;
 const CID_VIDEO: u8 = 7;
 
@@ -617,7 +620,7 @@ impl<S: ReadTimeoutControl> RtmpTransport<S> {
         t.send_set_chunk_size(NEGOTIATED_CHUNK_SIZE)?;
         t.chunk = NEGOTIATED_CHUNK_SIZE;
         t.connect_app()?;
-        let sid = t.create_stream()?;
+        let sid = t.create_stream_with_publish_setup()?;
         t.do_publish(sid)?;
         t.pid = sid;
         Ok(t)
@@ -644,11 +647,37 @@ impl<S: ReadTimeoutControl> RtmpTransport<S> {
         Ok(())
     }
 
+    /// Industry-grade publish setup: librtmp/OBS/pedro all send releaseStream
+    /// + FCPublish before createStream. Some servers (YouTube, nginx-rtmp with
+    /// auth) accept the plain connect→createStream→publish, but others treat
+    /// the stream as not publishable until FCPublish, showing "connected"
+    /// while never starting. We mirror the proven sequence:
+    ///   connect (1) → releaseStream (2) → FCPublish (3) → createStream (4) → publish (5)
+    /// releaseStream/FCPublish are fire-and-forget per spec (no _result awaited).
+    fn send_release_stream(&mut self) -> io::Result<()> {
+        let mut w = amf0::Writer::new();
+        w.string("releaseStream").number(2.0).null().string(&self.cfg.key);
+        self.send_message(CID_COMMAND, MSG_AMF0_COMMAND, 0, 0, &w.into_bytes())
+    }
+
+    fn send_fc_publish(&mut self) -> io::Result<()> {
+        let mut w = amf0::Writer::new();
+        w.string("FCPublish").number(3.0).null().string(&self.cfg.key);
+        self.send_message(CID_COMMAND, MSG_AMF0_COMMAND, 0, 0, &w.into_bytes())
+    }
+
+    fn create_stream_with_publish_setup(&mut self) -> io::Result<u32> {
+        // Fire-and-forget setup per librtmp: these must precede createStream.
+        let _ = self.send_release_stream();
+        let _ = self.send_fc_publish();
+        self.create_stream()
+    }
+
     fn create_stream(&mut self) -> io::Result<u32> {
         let mut w = amf0::Writer::new();
-        w.string("createStream").number(2.0).null();
+        w.string("createStream").number(4.0).null();
         self.send_message(CID_COMMAND, MSG_AMF0_COMMAND, 0, 0, &w.into_bytes())?;
-        let vals = self.await_result("createStream", 2.0)?;
+        let vals = self.await_result("createStream", 4.0)?;
         match vals.get(3) {
             Some(amf0::Val::Number(n)) if *n >= 0.0 => Ok(*n as u32),
             _ => Err(invalid("no stream id in createStream _result")),
@@ -658,11 +687,11 @@ impl<S: ReadTimeoutControl> RtmpTransport<S> {
     fn do_publish(&mut self, sid: u32) -> io::Result<()> {
         let mut w = amf0::Writer::new();
         w.string("publish")
-            .number(3.0)
+            .number(5.0)
             .null()
             .string(&self.cfg.key)
             .string("live");
-        self.send_message(CID_COMMAND, MSG_AMF0_COMMAND, sid, 0, &w.into_bytes())?;
+        self.send_message(CID_PUBLISH, MSG_AMF0_COMMAND, sid, 0, &w.into_bytes())?;
         self.await_publish_status()
     }
 

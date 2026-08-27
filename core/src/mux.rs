@@ -704,11 +704,18 @@ mod amf0 {
     }
 
     /// Build the `onMetaData` ECMA-array body.
+    /// Mirrors OBS/librtmp/pedro's exhaustive set so strict ingests (YouTube)
+    /// see a familiar shape: duration/filesize/encoder plus stereo etc.
+    /// Missing fields don't break most servers but YouTube's dashboard
+    /// historically gated "stream start" on having videocodecid/audiocodecid
+    /// plus valid width/height before the first keyframe.
     pub fn on_metadata(c: &StreamConfig) -> Vec<u8> {
         let mut out = Vec::new();
         string("onMetaData", &mut out);
         out.push(AMF0_ECMA_ARRAY);
-        out.extend_from_slice(&7u32.to_be_bytes()); // element count
+        // Count must match the number of properties we emit below.
+        let num_props = 13u32;
+        out.extend_from_slice(&num_props.to_be_bytes());
 
         property("duration", &mut out);
         number(0.0, &mut out);
@@ -719,11 +726,29 @@ mod amf0 {
         property("framerate", &mut out);
         number(c.framerate, &mut out);
         property("videocodecid", &mut out);
-        number(7.0, &mut out); // AVN
+        number(7.0, &mut out); // AVC
+        property("videodatarate", &mut out);
+        number((c.video_bitrate / 1000) as f64, &mut out); // kbps like OBS
         property("audiocodecid", &mut out);
         number(10.0, &mut out); // AAC
         property("audiosamplerate", &mut out);
         number(c.sample_rate as f64, &mut out);
+        property("audiosamplesize", &mut out);
+        number(16.0, &mut out);
+        property("audiodatarate", &mut out);
+        number((c.audio_bitrate / 1000) as f64, &mut out);
+        property("stereo", &mut out);
+        out.push(0x01); // AMF0_BOOL
+        out.push(1); // true → stereo (we try stereo first, matches 0xAF)
+
+        property("filesize", &mut out);
+        number(0.0, &mut out);
+        property("encoder", &mut out);
+        // Write string value for encoder
+        out.push(AMF0_STRING);
+        let enc = b"Strym/1.0 (FMLE/3.0 compatible; strym-core 1.0)";
+        out.extend_from_slice(&(enc.len() as u16).to_be_bytes());
+        out.extend_from_slice(enc);
 
         out.extend_from_slice(&AMF0_OBJECT_END);
         out
