@@ -704,10 +704,10 @@ mod amf0 {
     }
 
     /// Build the `onMetaData` ECMA-array body.
-    /// Mirrors OBS/librtmp/pedro's exhaustive set so strict ingests (YouTube)
-    /// see a familiar shape: duration/filesize/encoder plus stereo etc.
-    /// Missing fields don't break most servers but YouTube's dashboard
-    /// historically gated "stream start" on having videocodecid/audiocodecid
+    /// Mirrors `OBS`/`librtmp`/`pedro`'s exhaustive set so strict ingests (`YouTube`)
+    /// see a familiar shape: `duration`/`filesize`/`encoder` plus `stereo` etc.
+    /// Missing fields don't break most servers but `YouTube`'s dashboard
+    /// historically gated `stream start` on having `videocodecid`/`audiocodecid`
     /// plus valid width/height before the first keyframe.
     pub fn on_metadata(c: &StreamConfig) -> Vec<u8> {
         let mut out = Vec::new();

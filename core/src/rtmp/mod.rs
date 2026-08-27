@@ -647,13 +647,16 @@ impl<S: ReadTimeoutControl> RtmpTransport<S> {
         Ok(())
     }
 
-    /// Industry-grade publish setup: librtmp/OBS/pedro all send releaseStream
-    /// + FCPublish before createStream. Some servers (YouTube, nginx-rtmp with
-    /// auth) accept the plain connect→createStream→publish, but others treat
-    /// the stream as not publishable until FCPublish, showing "connected"
+    #[allow(clippy::doc_markdown, clippy::doc_lazy_continuation)]
+    /// Industry-grade publish setup: `librtmp`/`OBS`/`pedro` all send `releaseStream`
+    /// + `FCPublish` before `createStream`. Some servers (`YouTube`, `nginx-rtmp`
+    /// with auth) accept the plain `connect`→`createStream`→`publish`, but others
+    /// treat the stream as not publishable until `FCPublish`, showing `connected`
     /// while never starting. We mirror the proven sequence:
-    ///   connect (1) → releaseStream (2) → FCPublish (3) → createStream (4) → publish (5)
-    /// releaseStream/FCPublish are fire-and-forget per spec (no _result awaited).
+    /// `connect` (1) → `releaseStream` (2) → `FCPublish` (3) → `createStream` (4)
+    /// → `publish` (5).
+    /// `releaseStream`/`FCPublish` are fire-and-forget per spec (no `_result`
+    /// awaited).
     fn send_release_stream(&mut self) -> io::Result<()> {
         let mut w = amf0::Writer::new();
         w.string("releaseStream").number(2.0).null().string(&self.cfg.key);
